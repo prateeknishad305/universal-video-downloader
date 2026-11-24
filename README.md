@@ -210,6 +210,21 @@ tests/
 
 ---
 
+## Continuous integration
+
+`ci/github-actions-ci.yml` is a ready-made GitHub Actions workflow that runs
+the test suite on every push. Copy it into place to enable it:
+
+```bash
+mkdir -p .github/workflows
+cp ci/github-actions-ci.yml .github/workflows/ci.yml
+```
+
+(It ships in `ci/` because the GitHub API used to publish this repository
+refuses to write anything under `.github/workflows`.)
+
+---
+
 ## Tests
 
 ```bash
