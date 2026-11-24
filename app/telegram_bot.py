@@ -267,7 +267,10 @@ class TelegramDownloadBot:
         if analysis.get("kind") == "playlist":
             rows = build_episode_buttons(analysis, plan_id)
             keyboard = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(row["text"], callback_data=row["data"])] for row in rows]
+                [
+                    [InlineKeyboardButton(button["text"], callback_data=button["data"]) for button in row]
+                    for row in rows
+                ]
             )
             await status.edit_text(f"{summary}\n\nPick an episode:", reply_markup=keyboard)
             return
@@ -277,7 +280,10 @@ class TelegramDownloadBot:
             await status.edit_text("That link has no downloadable formats.")
             return
         keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(row["text"], callback_data=row["data"])] for row in rows]
+            [
+                [InlineKeyboardButton(button["text"], callback_data=button["data"]) for button in row]
+                for row in rows
+            ]
         )
         await status.edit_text(f"{summary}\n\nPick a quality:", reply_markup=keyboard)
 
@@ -374,8 +380,10 @@ class TelegramDownloadBot:
             await message.edit_text(format_progress(snapshot))
             return
 
-        path = Path(snapshot.get("filepath") or "")
-        if not path.exists():
+        # Use the job object for the path: the public snapshot deliberately
+        # hides server-side paths.
+        path = Path(job.filepath or "")
+        if not job.filepath or not path.exists():
             await message.edit_text("The file disappeared before it could be sent.")
             return
 
