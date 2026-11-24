@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Universal Video Downloader</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⬇️</text></svg>" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+
+<div class="aurora" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v12" /><path d="m7 11 5 5 5-5" /><path d="M4 20h16" />
+      </svg>
+    </span>
+    <div>
+      <h1>Universal Downloader</h1>
+      <p class="tagline">Video &amp; audio from 1,800+ sites</p>
+    </div>
+  </div>
+
+  <div class="status-bar" id="statusBar">
+    <span class="pill" id="pillYt"><i class="dot"></i><span>yt-dlp</span></span>
+    <span class="pill" id="pillFfmpeg"><i class="dot"></i><span>ffmpeg</span></span>
+    <button class="ghost-btn" id="sitesBtn" type="button">Supported sites</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ============================ LEFT COLUMN ============================ -->
+  <section class="column column-main">
+
+    <div class="panel input-panel">
+      <label class="field-label" for="urlInput">Paste a link</label>
+      <div class="input-row">
+        <div class="url-field">
+          <svg class="field-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
+            <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
+          </svg>
+          <input id="urlInput" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="https://www.youtube.com/watch?v=..." />
+        </div>
+        <button class="ghost-btn icon-only" id="pasteBtn" type="button" title="Paste from clipboard">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="8" y="2" width="8" height="4" rx="1" /><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+          </svg>
+        </button>
+        <button class="primary-btn" id="analyzeBtn" type="button">
+          <span class="btn-label">Analyze</span>
+          <span class="spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+      <p class="hint" id="inputHint">Supports YouTube, TikTok, Twitter/X, Instagram, Vimeo, Facebook, Reddit, Bilibili, SoundCloud, Twitch and 1,700+ more.</p>
+    </div>
+
+    <div id="results" class="results"></div>
+  </section>
+
+  <!-- ============================ RIGHT COLUMN =========================== -->
+  <aside class="column column-side">
+    <div class="panel downloads-panel">
+      <div class="panel-head">
+        <h2>Downloads</h2>
+        <div class="panel-head-actions">
+          <span class="counter" id="jobCounter">0</span>
+          <button class="ghost-btn tiny" id="clearFinishedBtn" type="button">Clear finished</button>
+        </div>
+      </div>
+      <div id="jobList" class="job-list">
+        <div class="empty-state" id="jobsEmpty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v12" /><path d="m7 11 5 5 5-5" /><path d="M4 20h16" />
+          </svg>
+          <p>No downloads yet</p>
+          <span>Analyze a link to get started.</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<!-- ============================== MODAL ============================== -->
+<div class="modal-backdrop" id="sitesModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="sitesModalTitle">
+    <div class="modal-head">
+      <h2 id="sitesModalTitle">Supported sites</h2>
+      <button class="ghost-btn icon-only" id="closeSitesBtn" type="button" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+      </button>
+    </div>
+    <input id="sitesSearch" class="search-input" type="search" placeholder="Filter sites..." />
+    <div class="site-list" id="siteList"></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
