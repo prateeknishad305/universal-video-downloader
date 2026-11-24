@@ -1,0 +1,44 @@
+services:
+  downloader:
+    build: .
+    image: universal-video-downloader
+    container_name: video-downloader
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      # Maximum number of simultaneous downloads
+      MAX_CONCURRENT_JOBS: "3"
+      # Set a token to require it for every API call
+      # API_TOKEN: "change-me"
+      # Optional: use cookies for sites that require a login
+      # COOKIES_FROM_BROWSER: "chrome"
+      # COOKIES_FILE: "/data/cookies.txt"
+      # Optional outbound proxy
+      # PROXY: "http://127.0.0.1:8080"
+
+      # --- optional MongoDB job history -----------------------------------
+      MONGO_URI: "mongodb://mongo:27017"
+      MONGO_DB: "universal_downloader"
+      MONGO_COLLECTION: "jobs"
+
+      # --- optional Telegram bot -------------------------------------------
+      # The bot starts automatically as soon as a token is present.
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_ALLOWED_CHATS: "${TELEGRAM_ALLOWED_CHATS:-}"
+      TELEGRAM_MAX_UPLOAD_MB: "${TELEGRAM_MAX_UPLOAD_MB:-50}"
+      PUBLIC_URL: "${PUBLIC_URL:-http://localhost:8000}"
+    depends_on:
+      - mongo
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    container_name: video-downloader-mongo
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
