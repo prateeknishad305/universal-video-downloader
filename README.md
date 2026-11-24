@@ -1,3 +1,5 @@
+<img width="1500" height="980" alt="ui_3_episode" src="https://github.com/user-attachments/assets/25e10ab5-c81e-49ec-8d8e-69f0cc7aa772" />
+<img width="1500" height="980" alt="ui_2_playlist" src="https://github.com/user-attachments/assets/9e87461c-6164-4711-b57b-1e7d2ad14a20" />
 # Universal Video Downloader
 
 A self-hosted web app that downloads **video and audio from ~1,800 different sites** —
