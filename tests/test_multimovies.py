@@ -87,7 +87,7 @@ def test_probe_episode_reports_servers_and_qualities(monkeypatch, episode_page):
     monkeypatch.setattr(
         multimovies,
         "resolve_embed",
-        lambda url, allow_browser=False: {
+        lambda url, allow_browser=False, **kwargs: {
             "method": "test",
             "media": ["https://cdn.example.com/hls/master.m3u8"],
             "error": None,
@@ -116,7 +116,11 @@ def test_probe_episode_keeps_unresolved_servers_visible(monkeypatch, episode_pag
     monkeypatch.setattr(
         multimovies,
         "resolve_embed",
-        lambda url, allow_browser=False: {"method": "test", "media": [], "error": "no resolver matched"},
+        lambda url, allow_browser=False, **kwargs: {
+            "method": "test",
+            "media": [],
+            "error": "no resolver matched",
+        },
     )
     with pytest.raises(multimovies.MultiMoviesError):
         multimovies.probe(EPISODE_URL)
@@ -129,7 +133,7 @@ def test_resolve_sources_fails_over_between_servers(monkeypatch, episode_page):
     calls: list = []
     seen: dict = {}
 
-    def fake_resolve(url, allow_browser=False):
+    def fake_resolve(url, allow_browser=False, **kwargs):
         calls.append(url)
         seen[url] = seen.get(url, 0) + 1
         # the first pass (analysis) succeeds, the second pass (download) fails

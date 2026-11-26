@@ -364,7 +364,9 @@ def resolve_sources(url: str, quality_id: str) -> List[Dict[str, Any]]:
 
     resolved: List[Dict[str, Any]] = []
     for source in sources:
-        result = resolve_embed(source["embed_url"], allow_browser=True)
+        # The deterministic resolvers are fast; the browser fallback is only
+        # used when they come up empty, and it is kept on a short leash.
+        result = resolve_embed(source["embed_url"], allow_browser=True, browser_timeout=25)
         media = result.get("media") or []
         if not media:
             resolved.append(

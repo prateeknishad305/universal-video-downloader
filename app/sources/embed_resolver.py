@@ -411,43 +411,56 @@ def resolve_with_browser(url: str, timeout: int = 60) -> List[str]:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             except Exception:
                 pass
+            import time
+
             for _ in range(20):
                 if "just a moment" not in (page.title() or "").lower():
                     break
-                import time
-
                 time.sleep(1)
-            import time
 
-            time.sleep(6)
-            # Multi-hop embeds need a click on their play button, and the
-            # media only starts flowing once the inner frame is alive.
-            for _ in range(3):
+            # Multi-hop embeds need a click on their play button, and some
+            # players run a proof-of-work challenge before they hand out the
+            # media URL. Give the page room and keep nudging every frame.
+            deadline = time.time() + max(timeout, 20)
+            while time.time() < deadline:
                 try:
-                    page.evaluate(
-                        """() => {
-                            const buttons = Array.from(document.querySelectorAll(
-                                'button,a[role=button],.play-button,[class*=play],[id*=play]'));
-                            for (const b of buttons) {
-                                const t = (b.textContent || '').trim().toLowerCase();
-                                if (t.includes('play') || t.includes('watch') || t === '') {
-                                    b.click();
-                                    break;
+                    frames = [page] + [f for f in page.frames if f != page.main_frame]
+                except Exception:
+                    frames = [page]
+                for frame in frames:
+                    try:
+                        frame.evaluate(
+                            """() => {
+                                for (const v of document.querySelectorAll('video')) {
+                                    v.muted = true;
+                                    if (v.currentSrc) { v.dataset.__u = v.currentSrc; }
+                                    v.play().catch(() => {});
                                 }
-                            }
-                        }"""
-                    )
-                except Exception:
-                    pass
-                try:
-                    page.evaluate(
-                        "const v=document.querySelector('video');"
-                        "if(v){v.muted=true;v.play().catch(()=>{});}"
-                    )
-                except Exception:
-                    pass
-                time.sleep(4)
-            time.sleep(6)
+                                for (const e of document.querySelectorAll(
+                                        'button,a[role=button],.play-button,[class*=play],[id*=play]')) {
+                                    const t = (e.textContent || '').trim().toLowerCase();
+                                    if (t.includes('play') || t.includes('watch') || t === '') {
+                                        e.click();
+                                        break;
+                                    }
+                                }
+                            }"""
+                        )
+                    except Exception:
+                        continue
+                    # The player may have set the source without a request.
+                    try:
+                        source = frame.evaluate(
+                            "() => { const v = document.querySelector('video');"
+                            " return v ? (v.currentSrc || v.src || '') : ''; }"
+                        )
+                        if source:
+                            candidates.append(source)
+                    except Exception:
+                        pass
+                if any(MEDIA_RE.search(item) for item in candidates):
+                    break
+                time.sleep(3)
 
             # Playlists served as ".txt" only work from inside the browser
             # session: the hosts behind them block plain HTTP clients.
@@ -478,7 +491,9 @@ def resolve_with_browser(url: str, timeout: int = 60) -> List[str]:
 # --------------------------------------------------------------------------- #
 
 
-def resolve_embed(url: str, allow_browser: bool = True) -> Dict[str, Any]:
+def resolve_embed(
+    url: str, allow_browser: bool = True, browser_timeout: int = 45
+) -> Dict[str, Any]:
     """Resolve an embed URL into candidate media URLs.
 
     Returns ``{"media": [...], "method": "...", "error": None}``.
@@ -495,7 +510,7 @@ def resolve_embed(url: str, allow_browser: bool = True) -> Dict[str, Any]:
             return {"media": media, "method": name, "error": None}
 
     if allow_browser:
-        media = resolve_with_browser(url)
+        media = resolve_with_browser(url, timeout=browser_timeout)
         if media:
             return {"media": media, "method": "browser", "error": None}
         errors.append("browser: no media request was captured")
