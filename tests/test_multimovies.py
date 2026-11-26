@@ -147,6 +147,55 @@ def test_resolve_sources_fails_over_between_servers(monkeypatch, episode_page):
     assert ready[0]["url"].endswith("1080/index.m3u8")
 
 
+def test_quality_tier_rounds_to_the_standard_step():
+    assert embed_resolver.quality_tier(718) == 720
+    assert embed_resolver.quality_tier(538) == 480
+    assert embed_resolver.quality_tier(1080) == 1080
+    assert embed_resolver.quality_tier(2160) == 2160
+    assert embed_resolver.quality_tier(None) is None
+
+
+def test_resolve_manifest_makes_relative_variants_absolute(monkeypatch):
+    master = (
+        "#EXTM3U\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=1800000,RESOLUTION=1280x720\n"
+        "/v/abc123\n"
+    )
+    fake = _FakeHttp({}, {"https://stream.vidbolt.xyz/v/master.m3u8": master})
+    monkeypatch.setattr(embed_resolver.http, "fetch", fake.fetch)
+    variants = embed_resolver.resolve_manifest("https://stream.vidbolt.xyz/v/master.m3u8")
+    assert variants[0]["url"] == "https://stream.vidbolt.xyz/v/abc123"
+    assert variants[0]["height"] == 720
+
+
+def test_resolve_cineverse_reads_the_player_frame(monkeypatch):
+    embed = (
+        '<iframe id="playerFrame" src="/proxy.php?p=vsembed&amp;c=opig5&amp;title=Test" '
+        'allowfullscreen></iframe>'
+    )
+    player = (
+        '<script> var src="https:\\/\\/s2.pureharvesthub.shop\\/laoj2mho\\/play\\/zodhb'
+        '\\/index-s720p-v1.txt"; var directSrc="x"; </script>'
+    )
+    pages = {
+        "https://rozgarlelo.modiplay.xyz/embed/tmdb/tv?id=652&s=3&e=14": embed,
+        "https://rozgarlelo.modiplay.xyz/proxy.php?p=vsembed&c=opig5&title=Test": player,
+    }
+    fake = _FakeHttp(pages, {})
+    monkeypatch.setattr(embed_resolver.http, "fetch", fake.fetch)
+
+    media = embed_resolver.resolve_cineverse(
+        "https://rozgarlelo.modiplay.xyz/embed/tmdb/tv?id=652&s=3&e=14"
+    )
+    assert media == [
+        "https://s2.pureharvesthub.shop/laoj2mho/play/zodhb/index-s720p-v1.txt"
+    ]
+
+
+def test_resolve_cineverse_ignores_other_embeds(monkeypatch):
+    assert embed_resolver.resolve_cineverse("https://vidbolt.xyz/tv/652/3/14") == []
+
+
 def test_resolve_manifest_parses_variants(monkeypatch):
     fake = _FakeHttp({}, {"*": MASTER})
     monkeypatch.setattr(embed_resolver.http, "fetch", fake.fetch)

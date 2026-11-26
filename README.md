@@ -433,32 +433,56 @@ a dedicated resolver:
 
 | Provider | How it is resolved |
 |---|---|
+| Cineverse | The embed only carries a player iframe; the proxied player document exposes the media URL as `var src="…"` |
 | Vidrift | The page carries an `embedMeta.playbackToken`; `/api/source/…` exchanges it for a `proxyUrl` |
 | VIDOUT | The episode maps to a `master.txt` in the GitHub-hosted manifest repository |
 | Vidbolt | The page carries `window.__VB__`; `/api/resolve` returns the stream URL (the call needs a `Referer` header, otherwise it answers `403`) |
 | Unknown | A headless Chromium fallback reads the player for providers without a resolver |
 
+**The `Referer` header**
+
+The streaming hosts behind Cineverse and VIDOUT answer with a Cloudflare
+block page ("Sorry, you have been blocked") unless the request carries the
+`Referer` of the player that uses the playlist. The app therefore sends the
+provider's embed URL as the `Referer` for both the playlist lookup and the
+download itself — including every HLS segment request.
+
 **Quality selection**
 
-Qualities are merged across providers. If two providers offer 1080p, both are
-tried in order and the first one that delivers wins:
+Qualities are merged across providers. If two providers offer 720p, both are
+tried in order and the first one that delivers wins. Heights are rounded to
+the standard tier, so a 1280x718 stream is listed as 720p instead of
+getting a tier of its own:
 
 ```
-1080p  →  Vidrift, Vidbolt
-720p   →  Vidrift, Vidbolt
-480p   →  Vidbolt
-360p   →  Vidrift
+720p  →  Cineverse, VIDOUT, Vidbolt
+480p  →  VIDOUT
+360p  →  Vidbolt
 ```
 
 HLS streams are downloaded with yt-dlp's native downloader; a stream that the
 native downloader cannot handle is retried with the ffmpeg downloader and
-`--hls-use-mpegts` before the source is written off.
+`--hls-use-mpegts` before the source is written off. Playlists that are
+served as a `.txt` file are handed to ffmpeg straight away, because the native
+downloader only recognises `.m3u8`. `pycryptodomex` is installed for the
+AES-128 protected streams these hosts use.
+
+Variant playlists that address their variants with a relative path are
+resolved against the playlist URL, so the downloader never hands a bare
+`/v/…` path to yt-dlp.
 
 **Verified end to end**
 
 `What's New, Scooby-Doo? S03E14 — E-Scream` was analysed and downloaded
-through the app: an H.265 854×480, 21 minute MP4 of 87.5 MB, served back
-over `/api/jobs/<id>/file` with `content-type: video/mp4`.
+through the app, twice:
+
+| Quality | Result |
+|---|---|
+| 480p | H.265 854×480, 21 min, 87.5 MB — served back over `/api/jobs/<id>/file` as `video/mp4` |
+| 360p | H.264 + AAC 640×360, 20.3 min, 79.4 MB — completed in the web UI |
+
+The analysis resolves three of the six providers at once (Cineverse, VIDOUT
+and Vidbolt) and reports the other three with the reason they were skipped.
 
 ---
 

@@ -509,12 +509,15 @@ def _download_source_list(
                 on_log=on_log,
                 should_cancel=should_cancel,
                 impersonate="chrome",
+                referer=source.get("referer"),
             )
         except CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             message = str(exc).strip() or exc.__class__.__name__
-            if ".m3u8" in destination.lower() and not source.get("ffmpeg_tried"):
+            lowered = destination.lower()
+            is_playlist = ".m3u8" in lowered or lowered.split("?")[0].endswith(".txt")
+            if is_playlist and not source.get("ffmpeg_tried"):
                 if on_log:
                     on_log("info", f"Retrying {host} with the ffmpeg downloader")
                 try:
@@ -529,6 +532,7 @@ def _download_source_list(
                         should_cancel=should_cancel,
                         impersonate="chrome",
                         use_ffmpeg=True,
+                        referer=source.get("referer"),
                     )
                 except CancelledError:
                     raise
@@ -604,6 +608,7 @@ def _download_direct(
     should_cancel: Optional[Callable[[], bool]] = None,
     impersonate: Optional[str] = None,
     use_ffmpeg: bool = False,
+    referer: Optional[str] = None,
 ) -> Path:
     """Download straight from *url* with yt-dlp."""
     finished: List[Path] = []
@@ -682,8 +687,15 @@ def _download_direct(
         # codecs, instead of failing the whole download.
         opts["merge_output_format"] = "mp4/mkv"
 
-    if use_ffmpeg:
-        # Some HLS hosts need ffmpeg to stitch the stream together.
+    if referer:
+        # Streaming hosts block requests that do not come from their player.
+        headers = dict(opts.get("http_headers") or {})
+        headers["Referer"] = referer
+        opts["http_headers"] = headers
+
+    # A playlist served as ".txt" is not recognised as HLS by the native
+    # downloader, so ffmpeg reads it directly.
+    if use_ffmpeg or url.lower().split("?")[0].endswith(".txt"):
         opts["downloader"] = "ffmpeg"
         opts["hls_use_mpegts"] = True
         opts["continuedl"] = True

@@ -22,11 +22,14 @@ import glob
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import http
 
 MEDIA_RE = re.compile(r"\.(m3u8|mp4|m4v|webm|mkv|ts)(\?|$)", re.I)
+# Some providers serve their HLS playlists as ".txt" files.
+PLAYLIST_RE = re.compile(r"\.(m3u8|txt)(\?|$)", re.I)
 # JSON keys that commonly hold a media URL.
 MEDIA_KEYS = (
     "proxyurl",
@@ -54,10 +57,14 @@ class EmbedError(Exception):
 def find_chromium() -> Optional[str]:
     """Locate a usable Chromium build for Playwright."""
     patterns = [
+        os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome"),
         os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"),
         os.path.expanduser(
             "~/.cache/ms-playwright/chromium_headless_shell-*/"
             "chrome-headless-shell-linux64/chrome-headless-shell"
+        ),
+        os.path.expanduser(
+            "~/.cache/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell"
         ),
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
@@ -213,6 +220,68 @@ def resolve_vidrift(url: str) -> List[str]:
     return _dig_media(payload)
 
 
+def quality_tier(height: Optional[int]) -> Optional[int]:
+    """Map a raw height onto the standard tier a quality picker shows.
+
+    Streams are often a few pixels off the usual numbers (1280x718 instead
+    of 1280x720), and those should not become their own tier.
+    """
+    if not height:
+        return None
+    for threshold, tier in (
+        (2000, 2160),
+        (1400, 1440),
+        (1000, 1080),
+        (600, 720),
+        (400, 480),
+        (250, 360),
+    ):
+        if height >= threshold:
+            return tier
+    return height
+
+
+def resolve_cineverse(url: str) -> List[str]:
+    """Resolve a Cineverse (vsembed) embed.
+
+    The embed page only carries a player iframe; the real media URL is
+    written into the proxied player document as a ``var src="..."`` line.
+    """
+    if "modiplay" not in url.lower():
+        return []
+    status, body, _ = http.fetch(url, timeout=45, impersonate="chrome")
+    if status >= 400:
+        raise EmbedError(f"The embed returned HTTP {status}.")
+
+    frame = ""
+    match = re.search(r'<iframe[^>]+src="([^"]*proxy\.php[^"]*)"', body, re.I)
+    if not match:
+        match = re.search(r'src="(/proxy\.php[^"]*)"', body, re.I)
+    if match:
+        frame = match.group(1).replace("&amp;", "&")
+        if frame.startswith("/"):
+            frame = f"https://{url.split('/')[2]}{frame}"
+
+    if not frame:
+        # Not a Cineverse embed - let the next resolver try.
+        return []
+
+    status, body, _ = http.fetch(frame, timeout=45, impersonate="chrome")
+    if status >= 400:
+        raise EmbedError(f"The player frame returned HTTP {status}.")
+
+    match = re.search(r'var\s+src\s*=\s*"([^"]+)"', body)
+    if not match:
+        match = re.search(r'"(https?:[^"]+\.m3u8[^"]*)"', body)
+    if not match:
+        raise EmbedError("The player frame does not expose a media URL.")
+
+    media = match.group(1).replace("\\/", "/")
+    if media.startswith("http"):
+        return [media]
+    raise EmbedError("The player frame exposed an unusable media URL.")
+
+
 def resolve_vidbolt(url: str) -> List[str]:
     """Vidbolt: the player asks ``/api/resolve`` for the stream."""
     status, body, _ = http.fetch(url, timeout=45)
@@ -258,6 +327,7 @@ DETERMINISTIC_RESOLVERS = (
     ("vidout", resolve_vidout),
     ("vidrift", resolve_vidrift),
     ("vidbolt", resolve_vidbolt),
+    ("cineverse", resolve_cineverse),
 )
 
 
@@ -276,6 +346,7 @@ def resolve_with_browser(url: str, timeout: int = 60) -> List[str]:
         return []
 
     candidates: List[str] = []
+    seen: Dict[str, List[str]] = {}
     executable = find_chromium()
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -305,6 +376,14 @@ def resolve_with_browser(url: str, timeout: int = 60) -> List[str]:
             )
             page = context.new_page()
 
+            def on_request(request):
+                try:
+                    request_url = request.url
+                except Exception:
+                    return
+                if PLAYLIST_RE.search(request_url):
+                    seen.setdefault("playlists", []).append(request_url)
+
             def on_response(response):
                 try:
                     response_url = response.url
@@ -327,6 +406,7 @@ def resolve_with_browser(url: str, timeout: int = 60) -> List[str]:
                     candidates.append(found)
 
             page.on("response", on_response)
+            page.on("request", on_request)
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             except Exception:
@@ -368,6 +448,20 @@ def resolve_with_browser(url: str, timeout: int = 60) -> List[str]:
                     pass
                 time.sleep(4)
             time.sleep(6)
+
+            # Playlists served as ".txt" only work from inside the browser
+            # session: the hosts behind them block plain HTTP clients.
+            for playlist in list(dict.fromkeys(seen.get("playlists", []))):
+                if playlist in candidates:
+                    continue
+                try:
+                    response = context.request.get(playlist, timeout=min(timeout, 30) * 1000)
+                    body = response.text()
+                except Exception:
+                    continue
+                if body.lstrip().startswith("#EXTM3U"):
+                    candidates.append(playlist)
+
             browser.close()
     except Exception:
         return []
@@ -409,9 +503,58 @@ def resolve_embed(url: str, allow_browser: bool = True) -> Dict[str, Any]:
     return {"media": [], "method": None, "error": "; ".join(errors) or "no resolver matched"}
 
 
-def resolve_manifest(url: str, timeout: int = 60) -> List[Dict[str, Any]]:
-    """Fetch an HLS master playlist and describe the qualities it offers."""
-    status, body, headers = http.fetch(url, timeout=timeout, impersonate="chrome")
+def browser_fetch(url: str, timeout: int = 45) -> Tuple[int, str]:
+    """Fetch a URL from inside Chromium, keeping the browser fingerprint.
+
+    A few streaming hosts sit behind a bot check that only lets a real
+    browser through, so a plain request is answered with 403.
+    """
+    if not playwright_available():
+        return 0, ""
+    executable = find_chromium()
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return 0, ""
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                executable_path=executable,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--mute-audio"],
+            )
+            try:
+                context = browser.new_context(user_agent=user_agent)
+                context.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                )
+                response = context.request.get(url, timeout=timeout * 1000)
+                return response.status, response.text()
+            finally:
+                browser.close()
+    except Exception:
+        return 0, ""
+
+
+def resolve_manifest(
+    url: str, timeout: int = 60, referer: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Fetch an HLS master playlist and describe the qualities it offers.
+
+    Several streaming hosts answer with a Cloudflare block page unless the
+    request carries the ``Referer`` of the player that uses the playlist.
+    """
+    request_headers = {"Referer": referer} if referer else None
+    status, body, headers = http.fetch(
+        url, timeout=timeout, impersonate="chrome", headers=request_headers
+    )
+    if status != 200:
+        # Some hosts only let a real browser through.
+        status, body = browser_fetch(url, timeout=min(timeout, 45))
     if status != 200:
         raise EmbedError(f"The manifest returned HTTP {status}.")
     if "#EXTM3U" not in body:
@@ -429,6 +572,9 @@ def resolve_manifest(url: str, timeout: int = 60) -> List[Dict[str, Any]]:
             if candidate and not candidate.startswith("#"):
                 target = candidate.strip()
                 break
+        if target:
+            # Variant playlists often use paths relative to the playlist.
+            target = urljoin(url, target)
         variants.append(
             {
                 "height": int(resolution.group(2)) if resolution else None,
@@ -438,6 +584,18 @@ def resolve_manifest(url: str, timeout: int = 60) -> List[Dict[str, Any]]:
             }
         )
     if not variants:
-        variants = [{"height": None, "width": None, "bandwidth": None, "url": url}]
+        # A single-quality playlist: the height is encoded in the file name.
+        height = None
+        match = re.search(r"[\-_]s(\d{3,4})p", url, re.I) or re.search(r"(\d{3,4})p", url)
+        if match:
+            height = int(match.group(1))
+        variants = [
+            {
+                "height": height,
+                "width": (height * 16 // 9) if height else None,
+                "bandwidth": None,
+                "url": url,
+            }
+        ]
     variants.sort(key=lambda item: item["height"] or 0, reverse=True)
     return variants

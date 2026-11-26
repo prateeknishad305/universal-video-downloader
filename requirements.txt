@@ -13,3 +13,6 @@ python-telegram-bot>=21.0
 
 # Optional MongoDB job history
 pymongo>=4.6
+
+# Decrypts AES-128 protected HLS streams (yt-dlp falls back to ffmpeg without it)
+pycryptodomex>=3.20

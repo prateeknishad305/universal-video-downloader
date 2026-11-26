@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import http
 from .embed_resolver import (
     extract_json_object,
+    quality_tier,
     resolve_embed,
     resolve_manifest,
 )
@@ -235,7 +236,7 @@ def probe_episode(url: str, resolve: bool = True) -> Dict[str, Any]:
         master = media[0]
         variants: List[Dict[str, Any]] = []
         try:
-            variants = resolve_manifest(master)
+            variants = resolve_manifest(master, referer=embed_url)
         except Exception as exc:  # noqa: BLE001
             server_report.append({"name": name, "state": "unresolved", "detail": str(exc)[:160]})
             continue
@@ -243,7 +244,8 @@ def probe_episode(url: str, resolve: bool = True) -> Dict[str, Any]:
         heights = []
         for variant in variants:
             height = variant.get("height")
-            quality_id = f"{height}p" if height else "auto"
+            tier = quality_tier(height)
+            quality_id = f"{tier}p" if tier else "auto"
             media_url = variant.get("url") or master
             formats.append(
                 {
@@ -301,6 +303,17 @@ def probe_episode(url: str, resolve: bool = True) -> Dict[str, Any]:
             }
         )
     qualities.sort(key=lambda item: item["height"] or 0, reverse=True)
+    # Merge tiers that describe the same picture size.
+    merged: Dict[str, Dict[str, Any]] = {}
+    for quality in qualities:
+        key = quality["id"]
+        if key in merged:
+            merged[key]["servers"].extend(quality["servers"])
+            merged[key]["label"] = f"{key} - {len(merged[key]['servers'])} server(s)"
+            merged[key]["hint"] = ", ".join(s["name"] for s in merged[key]["servers"])
+        else:
+            merged[key] = quality
+    qualities = sorted(merged.values(), key=lambda item: item["height"] or 0, reverse=True)
 
     meta = _json_ld(html)
     title = meta.get("name") or _title_from_html(html)
@@ -358,6 +371,7 @@ def resolve_sources(url: str, quality_id: str) -> List[Dict[str, Any]]:
                 {
                     "host": source["name"],
                     "url": None,
+                    "referer": source["embed_url"],
                     "state": "unresolved",
                     "detail": (result.get("error") or "no media found")[:200],
                 }
@@ -367,19 +381,21 @@ def resolve_sources(url: str, quality_id: str) -> List[Dict[str, Any]]:
         master = media[0]
         variants: List[Dict[str, Any]] = []
         try:
-            variants = resolve_manifest(master)
+            variants = resolve_manifest(master, referer=source["embed_url"])
         except Exception:
             variants = []
 
         target = master
         for variant in variants:
-            if f"{variant.get('height')}p" == quality_id:
+            tier = quality_tier(variant.get("height"))
+            if f"{tier}p" == quality_id:
                 target = variant.get("url") or master
                 break
         resolved.append(
             {
                 "host": source["name"],
                 "url": target,
+                "referer": source["embed_url"],
                 "state": "ready",
                 "detail": f"resolved via {result.get('method')}",
             }
