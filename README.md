@@ -439,6 +439,14 @@ a dedicated resolver:
 | Vidbolt | The page carries `window.__VB__`; `/api/resolve` returns the stream URL (the call needs a `Referer` header, otherwise it answers `403`) |
 | Unknown | A headless Chromium fallback reads the player for providers without a resolver |
 
+Two providers are deliberately left unresolved and are reported as such
+instead of hanging the download:
+
+| Provider | Why |
+|---|---|
+| GD mirror | The player hands out its source details encrypted and then runs a proof-of-work challenge behind a session path that changes on every load. The browser fallback reaches the player but cannot finish the challenge. |
+| Nexus | The host answers with a Cloudflare "temporarily rate limited" page. |
+
 **The `Referer` header**
 
 The streaming hosts behind Cineverse and VIDOUT answer with a Cloudflare
@@ -474,15 +482,19 @@ resolved against the playlist URL, so the downloader never hands a bare
 **Verified end to end**
 
 `What's New, Scooby-Doo? S03E14 — E-Scream` was analysed and downloaded
-through the app, twice:
+through the app three times, once through a different provider each time:
 
-| Quality | Result |
-|---|---|
-| 480p | H.265 854×480, 21 min, 87.5 MB — served back over `/api/jobs/<id>/file` as `video/mp4` |
-| 360p | H.264 + AAC 640×360, 20.3 min, 79.4 MB — completed in the web UI |
+| Quality | Provider | Result |
+|---|---|---|
+| 480p | Vidbolt | H.265 854×480, 21 min, 87.5 MB |
+| 480p | VIDOUT | H.264 960×538, 19.6 min, 82.7 MB |
+| 360p | Vidbolt | H.264 + AAC 640×360, 20.3 min, 79.4 MB |
+
+All three were served back over `/api/jobs/<id>/file` as `video/mp4`.
 
 The analysis resolves three of the six providers at once (Cineverse, VIDOUT
-and Vidbolt) and reports the other three with the reason they were skipped.
+and Vidbolt, with Vidrift appearing intermittently) and reports the others
+with the reason they were skipped.
 
 ---
 
