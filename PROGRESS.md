@@ -18,10 +18,11 @@ was merged into the local toonworld branch, so both features are in one tree.
 | `app/sources/browser.py` | Browser route can be switched off with `UVD_BROWSER_ENABLED=0` | done |
 | `app/storage.py` | pymongo is imported only when a Mongo URI is set | done |
 | `Dockerfile` | Slim image, optional Chromium build, memory friendly environment, non-root user, health check | done |
-| `render.yaml` | Blueprint: docker runtime, `/api/health`, `/data` disk, Mongo, generated `API_TOKEN` | done |
+| `render.yaml` | Blueprint: docker runtime, `/api/health`, 10 GB `/data` disk, generated `API_TOKEN` | done |
 | `Procfile` | `uvicorn` with `--proxy-headers` and a keep-alive timeout | done |
 | `requirements-browser.txt` | Playwright, kept out of the core requirements | done |
 | `run.sh` | Installs the browser requirements only when the browser route is on | done |
+| `app/jobs.py` | `_disk_free_mb()`, a size aware `_disk_space_problem()` and a guard that stops a download when the disk fills up | done |
 
 ### Endpoints
 
@@ -45,10 +46,13 @@ was merged into the local toonworld branch, so both features are in one tree.
 
 ### Tests
 
-- `pytest -q` - 97 passed, 2 skipped (also green without Playwright installed).
+- `pytest -q` - 99 passed, 2 skipped (also green without Playwright installed).
 - `merge_threads_test.py` - ffmpeg still merges a video and an audio stream
   with `-threads 2`: the result holds one `h264` video and one `aac` audio
   stream.
+- Two new tests in `tests/test_api.py` cover the disk guard: a download that
+  is refused when the disk is nearly full and a download that stops when the
+  disk fills up while it runs.
 
 ### Live state from this machine
 
@@ -57,8 +61,23 @@ was merged into the local toonworld branch, so both features are in one tree.
   a download of 5485935 bytes that `ffprobe` reads as 10.24 seconds.
 - The peak memory of that run was 109 MB, the import of the app 0.661 s with
   yt-dlp, Telegram and pymongo still unimported.
+- A 1 GiB file (1073741824 bytes) was downloaded through `/api/jobs` in 401
+  seconds. The server stayed at 104 MB and peaked at 112 MB, so the size of
+  the file costs disk and time, not memory.
 - Docker is not installed in this box, so the image was reviewed by hand and
   not built here.
+- `render.yaml` was checked against the official Render blueprint schema
+  (`https://render.com/schema/render.yaml.json`) and validates.
+
+### Big movies
+
+- `UVD_MAX_FILE_MB=2048` caps a download at 2 GB; yt-dlp aborts a bigger file
+  when the host announces its size.
+- A merge of a separate video and audio stream needs about twice the size of
+  the movie on the disk while it runs.
+- The disk guard refuses a download when less than `UVD_MIN_FREE_DISK_MB` is
+  free and stops a running download when the disk fills up, instead of ending
+  in a half written file.
 
 ## 2026-11-26 - toonworld4all.me download path
 

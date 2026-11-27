@@ -4,9 +4,11 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    plan: starter
+    plan: 0.5c-512mb
+    numInstances: 1
     healthCheckPath: /api/health
-    autoDeploy: false
+    autoDeployTrigger: "off"
+    maxShutdownDelaySeconds: 60
     envVars:
       - key: DATA_DIR
         value: /data
@@ -19,7 +21,7 @@ services:
       - key: UVD_MAX_FILE_MB
         value: "2048"
       - key: UVD_MIN_FREE_DISK_MB
-        value: "256"
+        value: "512"
       - key: UVD_MAX_HISTORY_JOBS
         value: "200"
       - key: UVD_FFMPEG_THREADS
@@ -27,9 +29,7 @@ services:
       - key: REQUEST_TIMEOUT
         value: "45"
       - key: MONGO_URI
-        fromDatabase:
-          name: uvd-history
-          property: connectionString
+        sync: false
       - key: MONGO_DB
         value: universal_downloader
       - key: MONGO_COLLECTION
@@ -44,9 +44,4 @@ services:
     disk:
       name: uvd-data
       mountPath: /data
-      sizeGB: 1
-
-databases:
-  - name: uvd-history
-    databaseName: universal_downloader
-    plan: free
+      sizeGB: 10

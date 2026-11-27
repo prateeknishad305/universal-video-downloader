@@ -268,6 +268,61 @@ def test_token_guard_blocks_api_without_token(client, monkeypatch):
     assert client.get("/api/jobs", headers={"X-API-Token": "secret-token"}).status_code == 200
 
 
+def test_download_stops_when_the_disk_runs_out_of_space(client, monkeypatch):
+    monkeypatch.setattr(ytdlp_client, "analyze", lambda url: dict(VIDEO_ANALYSIS))
+    monkeypatch.setattr(config, "MIN_FREE_DISK_MB", 256)
+
+    readings = iter([4096, 10])
+
+    monkeypatch.setattr("app.jobs._disk_free_mb", lambda: next(readings, 10))
+
+    def fake_download(url, *, outtmpl, selector, mode="video", subtitles=False,
+                      on_progress=None, on_log=None, should_cancel=None):
+        if on_progress:
+            on_progress({"downloaded_bytes": 10, "total_bytes": 1000,
+                         "speed": 1000.0, "eta": 1})
+        return Path(outtmpl.replace("%(ext)s", "mp4"))
+
+    monkeypatch.setattr("app.jobs.download_media", fake_download)
+
+    job_id = client.post("/api/jobs", json={"url": "https://example.com/watch?v=abc123"}).json()["id"]
+
+    deadline = time.time() + 15
+    job = {}
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").json()
+        if job["status"] in {"completed", "error", "cancelled"}:
+            break
+        time.sleep(0.1)
+
+    assert job["status"] == "error", job
+    assert "space" in (job["error"] or "").lower()
+
+
+def test_job_is_refused_when_the_disk_is_almost_full(client, monkeypatch):
+    monkeypatch.setattr(ytdlp_client, "analyze", lambda url: dict(VIDEO_ANALYSIS))
+    monkeypatch.setattr(config, "MIN_FREE_DISK_MB", 256)
+    monkeypatch.setattr("app.jobs._disk_free_mb", lambda: 5)
+
+    def never_called(url, **kwargs):
+        raise AssertionError("the download must not start")
+
+    monkeypatch.setattr("app.jobs.download_media", never_called)
+
+    job_id = client.post("/api/jobs", json={"url": "https://example.com/watch?v=abc123"}).json()["id"]
+
+    deadline = time.time() + 15
+    job = {}
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").json()
+        if job["status"] in {"completed", "error", "cancelled"}:
+            break
+        time.sleep(0.1)
+
+    assert job["status"] == "error", job
+    assert "free" in (job["error"] or "").lower()
+
+
 def test_detect_extractor_finds_known_sites():
     from app.ytdlp_client import detect_extractor, supported_extractors
 

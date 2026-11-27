@@ -23,19 +23,24 @@ from .ytdlp_client import (
 TERMINAL_STATES = {"completed", "error", "cancelled"}
 
 
-def _disk_space_problem() -> str:
-    """Complain when the download disk is too full for a new file."""
-    needed_mb = int(config.MIN_FREE_DISK_MB)
-    if needed_mb <= 0:
-        return ""
+def _disk_free_mb() -> int:
+    """Free space on the download disk in MB, 0 when it cannot be read."""
     try:
-        free_mb = shutil.disk_usage(str(config.DOWNLOAD_DIR)).free // (1024 * 1024)
+        return shutil.disk_usage(str(config.DOWNLOAD_DIR)).free // (1024 * 1024)
     except Exception:
+        return 0
+
+
+def _disk_space_problem(needed_mb: int = 0) -> str:
+    """Complain when the download disk is too full for a new file."""
+    required = int(config.MIN_FREE_DISK_MB) + max(0, needed_mb)
+    if required <= 0:
         return ""
-    if free_mb < needed_mb:
+    free_mb = _disk_free_mb()
+    if free_mb < required:
         return (
             f"The download disk has only {free_mb} MB free, "
-            f"at least {needed_mb} MB are needed."
+            f"at least {required} MB are needed."
         )
     return ""
 
@@ -305,6 +310,13 @@ class JobManager:
                         job.eta = data.get("eta")
                         job.progress = (done / total * 100.0) if total else 0.0
                         job.stage = "Downloading"
+                        if total and config.MIN_FREE_DISK_MB > 0:
+                            free_mb = _disk_free_mb()
+                            if free_mb < int(config.MIN_FREE_DISK_MB):
+                                raise RuntimeError(
+                                    f"The download disk ran out of space, "
+                                    f"only {free_mb} MB were left."
+                                )
                     job.touch()
 
             def on_log(level: str, message: str) -> None:

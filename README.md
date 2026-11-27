@@ -181,12 +181,17 @@ is needed: `Dockerfile`, `Procfile` and `render.yaml`.
 1. Push the repository to GitHub.
 2. In Render choose **New → Blueprint**, pick the repository and the
    `render.yaml` at its root.
-3. Render creates the web service, a MongoDB database and a 1 GB disk for the
-   downloads, then deploys.
+3. Render creates the web service with a 10 GB disk for the downloads and
+   deploys it.
 
 The blueprint generates an `API_TOKEN`. Pass it as `x-api-token` (or
 `?token=`) on every `/api` call; `/api/health` stays open so the platform can
 check the service.
+
+The blueprint cannot create MongoDB, so `MONGO_URI` waits for you. Create a
+MongoDB instance in the Render dashboard and paste its connection string into
+`MONGO_URI`. Without it the job history lives in memory and disappears with
+the service.
 
 ### 2. A plain Docker service
 
@@ -195,7 +200,27 @@ check the service.
 | Runtime | Docker |
 | Dockerfile path | `./Dockerfile` |
 | Health check path | `/api/health` |
-| Instance type | Starter (512 MB) or better |
+| Compute plan | `0.5c-512mb` (512 MB, 0.5 CPU) |
+| Disk | 10 GB on `/data` (a disk needs a paid plan) |
+
+The free plan works for testing, but it has no disk, so the files are gone
+after every restart, and a persistent disk cannot be attached to it.
+
+### 3. Big movies: 1-2 GB
+
+Big files are streamed to disk, so their size costs disk space and time, not
+memory. A 1 GiB download ran through the API with a peak of 112 MB of RAM.
+
+| Rule | Value |
+|---|---|
+| Largest file | `UVD_MAX_FILE_MB=2048` (2 GB). yt-dlp aborts a bigger file when the host announces its size |
+| Disk needed | The file itself, and about twice that while a separate video and audio stream are merged |
+| Disk guard | `UVD_MIN_FREE_DISK_MB=512` free space has to stay; a running download stops with a clear error when the disk fills up |
+| Disk on Render | 10 GB, so a 2 GB movie plus the merge fits with room to spare |
+
+A 2 GB movie on a 2 MB/s line takes about 17 minutes. Raise
+`UVD_MAX_FILE_MB` if you want bigger files and give the service a bigger disk
+at the same time.
 
 ### What keeps it fast and out of the OOM killer
 
@@ -206,7 +231,7 @@ check the service.
 | One uvicorn worker, no `--workers` | Every worker copies the whole Python heap |
 | `MAX_CONCURRENT_JOBS=1` | One download, one ffmpeg merge, one memory spike |
 | `UVD_MAX_FILE_MB=2048` | yt-dlp refuses a file bigger than the cap, so the disk cannot fill up |
-| `UVD_MIN_FREE_DISK_MB=256` | A download refuses to start when the disk is nearly full |
+| `UVD_MIN_FREE_DISK_MB=512` | A download refuses to start when the disk is nearly full and stops when it fills up |
 | `UVD_FFMPEG_THREADS=2` | ffmpeg stops from spawning a thread per core, which is what usually kills a small container |
 | `UVD_MAX_HISTORY_JOBS=200` | The in-memory job list cannot grow without a limit |
 | yt-dlp cache switched off (`cachedir: False`) | No growing cache directory in the container |
@@ -214,8 +239,8 @@ check the service.
 | Lazy imports | yt-dlp, Telegram and pymongo are only imported when they are used, so the container answers the health check in about 0.7 s |
 | `dumb-init` and `--proxy-headers` | Correct signal handling and the real client IP behind Render's proxy |
 
-A download on the free plan needs about 110 MB of RAM and a little disk space
-for the file itself. The Render disk (`/data`) keeps finished files between
+A download on the paid plan needs about 110 MB of RAM and the disk space for
+the file itself. The Render disk (`/data`) keeps finished files between
 deploys; without a disk the files disappear when the service restarts.
 
 ---
