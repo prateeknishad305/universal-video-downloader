@@ -24,7 +24,7 @@ batch queues, cancellation, and a clean API you can script against.
 | **Audio extraction** | Pull the MP3 (192 kbps) or keep the original audio codec |
 | **Playlists** | Expand a playlist, tick the videos you want, queue them all |
 | **Batch mode** | Paste many links and download them in parallel |
-| **Cancellation** | Stop a download mid-flight; partial files are cleaned up |
+| **Cancellation** | Stop a download mid-flight, or delete a running job; every leftover file is cleaned up |
 | **Subtitles** | Optionally embed subtitles when the source has them |
 | **Auth for gated sites** | Use browser cookies for age- or login-gated content |
 | **Telegram bot** | Send a link in Telegram, pick a quality with buttons, get the file back |
@@ -259,7 +259,7 @@ deploys; without a disk the files disappear when the service restarts.
 | `GET` | `/api/jobs/{id}` | One job's state |
 | `GET` | `/api/jobs/{id}/events` | Server-sent events with live progress |
 | `POST` | `/api/jobs/{id}/cancel` | Cancel a running download |
-| `DELETE` | `/api/jobs/{id}` | Forget a job (`?delete_file=true` also removes the file) |
+| `DELETE` | `/api/jobs/{id}` | Forget a job (`?delete_file=true` also removes the file); a running download is stopped first |
 | `GET` | `/api/jobs/{id}/file` | Download the finished file |
 | `POST` | `/api/clear-finished` | Remove all finished jobs from the list |
 
@@ -306,6 +306,7 @@ tests/
   test_toonworld.py        Episode, season and token parsing
   test_toonworld_hosts.py  Host resolvers
   test_toonworld_resolution.py  Resolution pipeline and download checks
+  test_jobs_cancel.py      Cancel and delete behaviour of the job queue
   test_multimovies.py      multimovies.wtf extractor
   test_storage.py          MongoDB / in-memory job history
   test_telegram_bot.py     Telegram command handling
@@ -455,6 +456,12 @@ token is resolved with a *fresh* session.
 | MEGA | the file key is used with the MEGA API; the payload is decrypted with AES-128-CTR |
 | AppDrive | the JavaScript redirect chain is followed to the real file |
 
+Every resolver is called with the **domain the archive stored** (`link.domain`,
+for example `https://hubcloud.mov/drive/`), so a host that moved to a new
+domain keeps working; the known domain is only the fallback. The host itself is
+matched by name, so `HubCloud`, `hubcloud.mov` and
+`https://hubcloud.mov/drive/` all land on the same resolver.
+
 **The shortener**
 
 The ids the archive stores are placeholders: the hosts answer *"the file does
@@ -464,6 +471,15 @@ When that happens the downloader opens a **real Chromium session**
 links the shortener hands out. Verification widgets are never clicked; the
 page is only given the chance to verify itself, and when it does not, the job
 reports that instead of pretending the file was downloaded.
+
+The browser route is used whenever the direct route does not produce a file:
+
+* the redirect page exposes **no file id** at all,
+* the stored id is rejected by its host (a placeholder id),
+* the resolved link does not serve a file.
+
+The link the browser finds is matched back to the source by host name, so a
+shortener page that offers one link per host still fills the right tier.
 
 **The tokens rotate**
 

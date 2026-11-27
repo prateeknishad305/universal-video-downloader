@@ -132,12 +132,28 @@ def _extract_url(payload: Any, depth: int = 0) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 
 
+def _site_base(domain: Optional[str], fallback: str) -> str:
+    """Use the domain the archive stored, fall back to the known one."""
+    if not domain:
+        return fallback
+    text = domain.strip()
+    if not text.startswith("http"):
+        text = f"https://{text.lstrip('/')}"
+    text = text.split("?", 1)[0].split("#", 1)[0]
+    if "//" in text:
+        text = text.split("//", 1)[1]
+    netloc = text.split("/", 1)[0]
+    if not netloc:
+        return fallback
+    return f"https://{netloc}"
+
+
 def resolve_filepress(file_id: str, *, referer: Optional[str] = None,
-                      timeout: int = 45) -> HostResult:
+                      timeout: int = 45, domain: Optional[str] = None) -> HostResult:
     """Resolve a Filepress id through its public JSON endpoint."""
     if not file_id:
         return HostResult(state="missing", detail="the link carries no Filepress id")
-    url = f"{FILEPRESS_BASE}/api/file/get/{file_id}"
+    url = f"{_site_base(domain, FILEPRESS_BASE)}/api/file/get/{file_id}"
     if referer:
         url = f"{url}?referrer={referer}"
     try:
@@ -178,11 +194,12 @@ def resolve_filepress(file_id: str, *, referer: Optional[str] = None,
     )
 
 
-def resolve_gdflix(file_id: str, *, timeout: int = 45) -> HostResult:
+def resolve_gdflix(file_id: str, *, timeout: int = 45,
+                   domain: Optional[str] = None) -> HostResult:
     """Resolve a GDFlix id into the Google Drive link it wraps."""
     if not file_id:
         return HostResult(state="missing", detail="the link carries no GDFlix id")
-    url = f"{GDFLIX_BASE}/file/{file_id}"
+    url = f"{_site_base(domain, GDFLIX_BASE)}/file/{file_id}"
     try:
         status, body, _ = http.fetch(url, timeout=timeout)
     except Exception as exc:  # noqa: BLE001
@@ -206,11 +223,13 @@ def resolve_gdflix(file_id: str, *, timeout: int = 45) -> HostResult:
     )
 
 
-def resolve_hubcloud(file_id: str, *, timeout: int = 45) -> HostResult:
+def resolve_hubcloud(file_id: str, *, timeout: int = 45,
+                     domain: Optional[str] = None) -> HostResult:
     """Resolve a HubCloud id, passing its JavaScript challenge on the way."""
     if not file_id:
         return HostResult(state="missing", detail="the link carries no HubCloud id")
-    page_url = f"{HUBCLOUD_BASE}/drive/{file_id}"
+    base = _site_base(domain, HUBCLOUD_BASE)
+    page_url = f"{base}/drive/{file_id}"
     session = _session()
     body = ""
     status = 0
@@ -220,7 +239,7 @@ def resolve_hubcloud(file_id: str, *, timeout: int = 45) -> HostResult:
         if session is not None:
             for _ in range(3):
                 status, body, headers = _session_get(
-                    session, page_url, referer=HUBCLOUD_BASE, timeout=timeout
+                    session, page_url, referer=base, timeout=timeout
                 )
                 challenge = _CHALLENGE_RE.search(body)
                 if not challenge:
@@ -228,7 +247,7 @@ def resolve_hubcloud(file_id: str, *, timeout: int = 45) -> HostResult:
                 page_url = challenge.group(1)
             try:
                 status, body, headers = _session_get(
-                    session, page_url, referer=HUBCLOUD_BASE, timeout=timeout
+                    session, page_url, referer=base, timeout=timeout
                 )
             except Exception:
                 pass
@@ -244,7 +263,7 @@ def resolve_hubcloud(file_id: str, *, timeout: int = 45) -> HostResult:
     if _looks_missing(body):
         return HostResult(state="missing", detail="HubCloud says the file does not exist")
 
-    api_result = _hubcloud_download_api(session, file_id, timeout=timeout)
+    api_result = _hubcloud_download_api(session, file_id, timeout=timeout, base=base)
     if api_result.ready:
         return api_result
 
@@ -259,10 +278,11 @@ def resolve_hubcloud(file_id: str, *, timeout: int = 45) -> HostResult:
     )
 
 
-def _hubcloud_download_api(session, file_id: str, *, timeout: int = 45) -> HostResult:
+def _hubcloud_download_api(session, file_id: str, *, timeout: int = 45,
+                           base: str = HUBCLOUD_BASE) -> HostResult:
     """Ask ``api/downloader.php`` for the real file URL."""
-    api_url = f"{HUBCLOUD_BASE}/api/downloader.php"
-    payload = {"id": file_id, "referer": f"{HUBCLOUD_BASE}/drive/{file_id}"}
+    api_url = f"{base}/api/downloader.php"
+    payload = {"id": file_id, "referer": f"{base}/drive/{file_id}"}
     try:
         if session is not None:
             status, body, _ = _session_post_json(session, api_url, payload, timeout=timeout)
@@ -375,30 +395,76 @@ RESOLVERS = {
 }
 
 
+_HOST_ALIASES = {
+    "filepress": "filepress",
+    "filebee": "filepress",
+    "gdflix": "gdflix",
+    "hubcloud": "hubcloud",
+    "appdrive": "appdrive",
+    "mega": "mega",
+    "megadrive": "mega",
+}
+
+_HOST_NEEDLES = (
+    ("filepress", ("filepress", "filebee")),
+    ("gdflix", ("gdflix",)),
+    ("hubcloud", ("hubcloud",)),
+    ("appdrive", ("appdrive",)),
+    ("mega", ("mega", "megadrive")),
+)
+
+
+def _host_name(value: str) -> str:
+    """Reduce a host label or URL to the name of the site."""
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    if "//" in text:
+        text = text.split("//", 1)[1]
+    text = text.split("/", 1)[0]
+    text = text.split("@")[-1]
+    text = text.split(":", 1)[0]
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
 def normalize_host(host: str) -> str:
-    """Map a host label onto the key used by :data:`RESOLVERS`."""
-    value = re.sub(r"[^a-z0-9]+", "", (host or "").lower())
-    aliases = {
-        "filepress": "filepress",
-        "filebee": "filepress",
-        "gdflix": "gdflix",
-        "hubcloud": "hubcloud",
-        "appdrive": "appdrive",
-        "mega": "mega",
-        "megadrive": "mega",
-    }
-    return aliases.get(value, value)
+    """Map a host label or URL onto the key used by :data:`RESOLVERS`.
+
+    The archive used to store a plain label (``HubCloud``) and now stores the
+    full prefix of the file page (``https://hubcloud.mov/drive/``).  Both have
+    to land on the same resolver.
+    """
+    value = (host or "").strip().lower()
+    if not value:
+        return ""
+    name = _host_name(value)
+    if not name:
+        return ""
+    if name in _HOST_ALIASES:
+        return _HOST_ALIASES[name]
+    for key, needles in _HOST_NEEDLES:
+        for needle in needles:
+            if needle in name:
+                return key
+    return re.sub(r"[^a-z0-9]+", "", value)
 
 
 def resolve(host: str, file_id: str, *, referer: Optional[str] = None,
-            timeout: int = 45) -> HostResult:
-    """Resolve *file_id* on *host* into a downloadable URL."""
+            timeout: int = 45, domain: Optional[str] = None) -> HostResult:
+    """Resolve *file_id* on *host* into a downloadable URL.
+
+    *domain* is the file page prefix the archive stored, for example
+    ``https://hubcloud.mov/drive/``.  When it is given the resolver uses the
+    domain the site currently serves instead of the hard coded one.
+    """
     key = normalize_host(host)
     resolver = RESOLVERS.get(key)
     if resolver is None:
         return HostResult(state="unknown", detail=f"no resolver for host '{host}'")
     if key == "filepress":
-        return resolver(file_id, referer=referer, timeout=timeout)
+        return resolver(file_id, referer=referer, timeout=timeout, domain=domain)
+    if key in {"hubcloud", "gdflix"} and domain:
+        return resolver(file_id, timeout=timeout, domain=domain)
     try:
         return resolver(file_id, timeout=timeout)
     except TypeError:

@@ -30,6 +30,13 @@ def episode_page(monkeypatch):
     return body
 
 
+@pytest.fixture(autouse=True)
+def no_browser(monkeypatch):
+    """Keep the browser fallback out of the offline tests."""
+    monkeypatch.setattr(toonworld, "_browser_links_for_sources", lambda *a, **kw: {})
+    return None
+
+
 def test_interstitial_exposes_the_shortener_and_the_host(monkeypatch):
     body = read_fixture("redirect_props_page.html")
     monkeypatch.setattr(toonworld.http, "fetch", lambda url, **_kw: (200, body, {}))
@@ -56,6 +63,7 @@ def test_host_id_from_url(url, host, file_id):
 
 
 def test_resolve_sources_uses_the_host_resolver(episode_page, monkeypatch):
+    monkeypatch.setattr(toonworld, "validate_host_id", lambda host, file_id: None)
     monkeypatch.setattr(
         toonworld,
         "resolve_interstitial",

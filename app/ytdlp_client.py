@@ -792,8 +792,11 @@ def _download_direct(
     def postprocessor_hook(data: Dict[str, Any]) -> None:
         status = data.get("status")
         name = data.get("postprocessor")
-        if status == "started" and on_log:
-            on_log("info", f"Post-processing: {name}")
+        if status == "started":
+            if should_cancel and should_cancel():
+                raise CancelledError("Download cancelled by the user.")
+            if on_log:
+                on_log("info", f"Post-processing: {name}")
         elif status == "finished" and on_log:
             on_log("info", f"Post-processing finished: {name}")
 
@@ -880,17 +883,38 @@ def _resolve_final_path(info: Optional[Dict[str, Any]], finished: List[Path]) ->
     return None
 
 
-def find_partial_files(directory, stem: str) -> List[Path]:
-    """Return partial (``*.part``) files belonging to *stem*."""
+def find_partial_files(directory, stem: str, keep: Optional[Path] = None) -> List[Path]:
+    """Return the leftover files of a cancelled download.
+
+    yt-dlp leaves more than ``*.part`` behind: the separate streams of a merge
+    (``*.f137.mp4``), the merge output (``*.temp.mp4``), the resume information
+    (``*.ytdl``) and the fragments of a split download (``*.part-Frag0``).
+    """
     directory = Path(directory)
     if not directory.exists():
         return []
-    return [p for p in directory.glob(f"{stem}*") if p.suffix == ".part"]
+    keep_resolved = keep.resolve() if keep is not None else None
+    leftovers: List[Path] = []
+    for path in directory.glob(f"{stem}*"):
+        name = path.name
+        if keep_resolved is not None and path.resolve() == keep_resolved:
+            continue
+        if path.suffix == ".part" or ".part-" in name:
+            leftovers.append(path)
+        elif name.endswith(".ytdl"):
+            leftovers.append(path)
+        elif ".temp." in name:
+            leftovers.append(path)
+        elif re.search(r"\.f\d+\.", name):
+            leftovers.append(path)
+    return leftovers
 
 
-def remove_partial_files(directory, stem: str) -> None:
+def remove_partial_files(
+    directory, stem: str, keep: Optional[Path] = None
+) -> None:
     """Delete partial files left behind by a cancelled download."""
-    for path in find_partial_files(directory, stem):
+    for path in find_partial_files(directory, stem, keep):
         try:
             path.unlink()
         except OSError:

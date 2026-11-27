@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.sources import http, toonworld  # noqa: E402
+from app.sources import http, toonworld, toonworld_hosts  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -45,6 +45,13 @@ def fake_fetch(monkeypatch):
     return _fetch
 
 
+@pytest.fixture(autouse=True)
+def no_browser(monkeypatch):
+    """Keep the browser fallback out of the offline tests."""
+    monkeypatch.setattr(toonworld, "_browser_links_for_sources", lambda *a, **kw: {})
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # tests
 # --------------------------------------------------------------------------- #
@@ -65,6 +72,49 @@ def test_probe_season_returns_episode_playlist(fake_fetch):
     first = analysis["entries"][0]
     assert first["url"].endswith("/episode/naruto-shippuden-1x373")
     assert "373" in first["title"]
+
+
+def test_probe_season_uses_the_heading_title_and_the_episode_link(fake_fetch):
+    analysis = toonworld.probe(
+        "https://toonworld4all.me/naruto-shippuden-season-18-episodes-bluray-hindi-multi-audio/"
+    )
+    titles = [entry["title"] for entry in analysis["entries"]]
+    assert "Episode 373: Team 7, Assemble!" in titles
+    first = analysis["entries"][0]
+    assert first["id"] == "naruto-shippuden-1x373"
+    assert first["url"] == "https://archive.toonworld4all.me/episode/naruto-shippuden-1x373"
+    assert all("Episode" in title for title in titles)
+
+
+def test_probe_season_keeps_the_headings_apart(monkeypatch):
+    body = (
+        '<div class="mks_accordion_heading"><strong>Episode 1: One</strong></div>'
+        '<div class="mks_accordion_content">'
+        '<a href="https://archive.toonworld4all.me/episode/show-1x1">Watch</a></div>'
+        '<div class="mks_accordion_heading"><strong>Episode 2: Two</strong></div>'
+        '<div class="mks_accordion_content">'
+        '<a href="https://archive.toonworld4all.me/episode/show-1x2">Watch</a></div>'
+    )
+    monkeypatch.setattr(http, "fetch", lambda url, **kw: (200, body, {}))
+    analysis = toonworld.probe_season("https://toonworld4all.me/show-season-1/")
+    assert [entry["id"] for entry in analysis["entries"]] == ["show-1x1", "show-1x2"]
+    assert [entry["title"] for entry in analysis["entries"]] == [
+        "Episode 1: One",
+        "Episode 2: Two",
+    ]
+
+
+def test_probe_season_accepts_relative_episode_links(monkeypatch):
+    body = (
+        '<div class="mks_accordion_heading"><strong>Episode 5: Five</strong></div>'
+        '<div class="mks_accordion_content">'
+        '<a href="/episode/show-1x5">Watch</a></div>'
+    )
+    monkeypatch.setattr(http, "fetch", lambda url, **kw: (200, body, {}))
+    analysis = toonworld.probe_season("https://toonworld4all.me/show-season-1/")
+    assert analysis["entries"][0]["url"] == (
+        "https://archive.toonworld4all.me/episode/show-1x5"
+    )
 
 
 def test_probe_episode_returns_quality_ladder(fake_fetch):
@@ -159,8 +209,159 @@ def test_validate_host_id_flags_the_wrong_id_format():
     assert toonworld.validate_host_id("Filepress", "1qgzbq5ve6yt3x5jn56zrzv0")
     assert toonworld.validate_host_id("Filepress", "0123456789abcdef01234567") is None
     assert toonworld.validate_host_id("MEGA", "x" * 52)
-    assert toonworld.validate_host_id("MEGA", "y" * 22) is None
+    assert toonworld.validate_host_id("MEGA", f"{'y' * 22}#{'k' * 43}") is None
     assert toonworld.validate_host_id("HubCloud", "anything-goes") is None
+
+
+def test_validate_host_id_names_the_mega_handle_and_not_the_key():
+    handle = "y" * 22
+    key = "z" * 43
+    problem = toonworld.validate_host_id("MEGA", f"{handle}#{key}")
+    assert problem is None
+    broken = toonworld.validate_host_id("MEGA", f"{'x' * 8}#{key}")
+    assert "8 chars" in broken
+    assert "22 characters" in broken
+
+
+def test_host_id_from_url_keeps_the_whole_mega_handle():
+    handle = "abcdefghijklmnopqrstuv"
+    key = "k" * 43
+    host, file_id = toonworld.host_id_from_url(f"https://mega.nz/file/{handle}#{key}")
+    assert host == "mega"
+    assert file_id == f"{handle}#{key}"
+
+
+def _single_source_episode(monkeypatch, host="HubCloud", token="t" * 64):
+    monkeypatch.setattr(
+        toonworld,
+        "probe_episode",
+        lambda url: {
+            "qualities": [
+                {
+                    "id": "480p",
+                    "size": 1234,
+                    "sources": [{"host": host, "token": token}],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        toonworld, "probe_destination", lambda url: {"state": "ready", "detail": ""}
+    )
+
+
+def test_browser_fallback_is_used_when_the_page_hides_the_file_id(monkeypatch):
+    """A redirect page without a file id must not end the resolution."""
+    _single_source_episode(monkeypatch)
+    monkeypatch.setattr(
+        toonworld,
+        "resolve_interstitial",
+        lambda token, timeout=60: {
+            "host": "https://hubcloud.mov/drive/",
+            "file_id": None,
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        toonworld,
+        "_browser_links_for_sources",
+        lambda quality, url, timeout=150: {
+            "t" * 64: {
+                "links": [
+                    {
+                        "host": "hubcloud",
+                        "file_id": "cw5hwamg0sy0by7",
+                        "url": "https://hubcloud.mov/drive/cw5hwamg0sy0by7",
+                    }
+                ],
+                "error": None,
+            }
+        },
+    )
+    seen = {}
+
+    def _resolve(host, file_id, **kwargs):
+        seen["host"] = host
+        seen["file_id"] = file_id
+        seen["domain"] = kwargs.get("domain")
+        return toonworld_hosts.HostResult(
+            url="https://hubcloud.mov/drive/cw5hwamg0sy0by7",
+            state="ready",
+            detail="resolved",
+        )
+
+    monkeypatch.setattr(toonworld_hosts, "resolve", _resolve)
+    sources = toonworld.resolve_sources("https://archive.toonworld4all.me/episode/x", "480p")
+    assert sources[0]["url"] == "https://hubcloud.mov/drive/cw5hwamg0sy0by7"
+    assert sources[0]["state"] == "ready"
+    assert seen["file_id"] == "cw5hwamg0sy0by7"
+    assert seen["domain"] == "hubcloud.mov"
+
+
+def test_browser_fallback_is_used_when_the_stored_id_is_dead(monkeypatch):
+    """A placeholder id that 404s must be replaced by the browser result."""
+    _single_source_episode(monkeypatch)
+    monkeypatch.setattr(
+        toonworld,
+        "resolve_interstitial",
+        lambda token, timeout=60: {
+            "host": "https://hubcloud.mov/drive/",
+            "file_id": "cw5hwamg0sy0by7",
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        toonworld,
+        "_browser_links_for_sources",
+        lambda quality, url, timeout=150: {
+            "t" * 64: {
+                "links": [
+                    {
+                        "host": "hubcloud",
+                        "file_id": "freshid123",
+                        "url": "https://hubcloud.mov/drive/freshid123",
+                    }
+                ],
+                "error": None,
+            }
+        },
+    )
+
+    def _resolve(host, file_id, **kwargs):
+        if file_id == "freshid123":
+            return toonworld_hosts.HostResult(
+                url="https://hubcloud.mov/drive/freshid123", state="ready", detail="resolved"
+            )
+        return toonworld_hosts.HostResult(
+            state="missing", detail="HubCloud says the file does not exist"
+        )
+
+    monkeypatch.setattr(toonworld_hosts, "resolve", _resolve)
+    sources = toonworld.resolve_sources("https://archive.toonworld4all.me/episode/x", "480p")
+    assert sources[0]["url"] == "https://hubcloud.mov/drive/freshid123"
+    assert sources[0]["state"] == "ready"
+
+
+def test_browser_fallback_reason_is_reported_when_it_cannot_run(monkeypatch):
+    _single_source_episode(monkeypatch)
+    monkeypatch.setattr(
+        toonworld,
+        "resolve_interstitial",
+        lambda token, timeout=60: {
+            "host": "https://hubcloud.mov/drive/",
+            "file_id": None,
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(toonworld, "_browser_links_for_sources", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        toonworld,
+        "_browser_fallback_reason",
+        lambda: "the browser fallback is not available on this deployment",
+    )
+    sources = toonworld.resolve_sources("https://archive.toonworld4all.me/episode/x", "480p")
+    assert sources[0]["url"] is None
+    assert "browser fallback is not available" in sources[0]["detail"]
 
 
 def test_probe_destination_classifies_a_missing_file(monkeypatch):

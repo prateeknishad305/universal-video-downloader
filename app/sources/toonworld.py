@@ -38,9 +38,17 @@ _PROPS_RE = re.compile(r"window\.__PROPS__\s*=\s*(\{.*?\});?\s*</script>", re.S)
 _CODE_RE = re.compile(r'<code[^>]*>(.*?)</code>', re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
 _HEADING_RE = re.compile(
-    r'mks_accordion_heading[^>]*><strong>(?P<title>[^<]+)</strong>.*?'
-    r'href="(?P<url>https?://[^"]+/redirect/[a-f0-9]+)"',
+    r'mks_accordion_heading[^>]*><strong>(?P<title>[^<]+)</strong>'
+    r'(?P<body>(?:(?!mks_accordion_heading).)*)',
     re.S,
+)
+_EPISODE_HREF_RE = re.compile(
+    r'href="(?P<url>(?:https?://[^"]+)?/episode/(?P<slug>[a-z0-9\-]+))"',
+    re.I,
+)
+_REDIRECT_HREF_RE = re.compile(
+    r'href="(?P<url>(?:https?://[^"]+)?/redirect/(?P<token>[a-f0-9]+))"',
+    re.I,
 )
 
 
@@ -98,20 +106,28 @@ def probe_season(url: str) -> Dict[str, Any]:
     entries: List[Dict[str, Any]] = []
     seen = set()
     for match in _HEADING_RE.finditer(body):
-        episode_url = match.group("url")
-        slug = _EPISODE_RE.search(episode_url)
-        if not slug:
-            continue
-        key = slug.group("slug")
+        title = re.sub(r"\s+", " ", match.group("title")).strip()
+        block = match.group("body")
+        episode = _EPISODE_HREF_RE.search(block)
+        if episode:
+            key = episode.group("slug")
+            link = episode.group("url")
+        else:
+            redirect = _REDIRECT_HREF_RE.search(block)
+            if not redirect:
+                continue
+            key = redirect.group("token")
+            link = redirect.group("url")
         if key in seen:
             continue
         seen.add(key)
-        title = re.sub(r"\s+", " ", match.group("title")).strip()
+        if not link.startswith("http"):
+            link = f"https://{ARCHIVE}{link}"
         entries.append(
             {
                 "id": key,
                 "title": title,
-                "url": f"https://{ARCHIVE}/episode/{key}",
+                "url": link,
                 "duration": None,
                 "thumbnail": None,
                 "uploader": None,
@@ -314,7 +330,7 @@ _HOST_PATTERNS = (
     ("hubcloud", re.compile(r"hubcloud\.[a-z.]+/drive/([A-Za-z0-9]{6,32})", re.I)),
     ("filepress", re.compile(r"filepress\.[a-z.]+/file/([A-Za-z0-9]{16,32})", re.I)),
     ("gdflix", re.compile(r"gdflix\.[a-z.]+/file/([A-Za-z0-9]{6,32})", re.I)),
-    ("mega", re.compile(r"mega\.nz/file/([A-Za-z0-9]{8})#([A-Za-z0-9_-]{20,64})", re.I)),
+    ("mega", re.compile(r"mega\.nz/file/([A-Za-z0-9_-]{8,64})#([A-Za-z0-9_-]{20,64})", re.I)),
     ("appdrive", re.compile(r"appdrive\.[a-z.]+/file/([A-Za-z0-9]{6,32})", re.I)),
 )
 
@@ -511,18 +527,26 @@ def validate_host_id(host: str, file_id: str) -> Optional[str]:
     """
     if not file_id:
         return "the link carries no file id"
-    if host.lower() == "filepress" and not _HEX24_RE.match(file_id):
+    key = toonworld_hosts.normalize_host(host)
+    if key == "filepress" and not _HEX24_RE.match(file_id):
         return (
             f"invalid FilePress id '{file_id[:28]}' - FilePress only accepts a "
             "24 character hexadecimal object id"
         )
-    if host.lower() == "appdrive" and len(file_id) < 6:
+    if key == "appdrive" and len(file_id) < 6:
         return f"invalid AppDrive id '{file_id[:28]}' - AppDrive ids are at least 6 characters"
-    if host.lower() == "mega" and len(file_id) != 22:
-        return (
-            f"invalid MEGA handle '{file_id[:28]}' ({len(file_id)} chars) - "
-            "MEGA file handles are 22 characters"
-        )
+    if key == "mega":
+        handle = file_id.split("#", 1)[0].strip()
+        if "#" not in file_id:
+            return (
+                f"incomplete MEGA link '{handle[:28]}' - the archive stored the file "
+                "handle without its decryption key"
+            )
+        if len(handle) < 20 or len(handle) > 64:
+            return (
+                f"invalid MEGA handle '{handle[:28]}' ({len(handle)} chars) - "
+                "MEGA file handles are 22 characters"
+            )
     return None
 
 
@@ -614,7 +638,7 @@ def resolve_sources(url: str, quality_id: str) -> List[Dict[str, Any]]:
         state = "unknown"
         kind = "http"
         extra: Dict[str, Any] = {}
-        host_known = False
+        host_known = bool(host)
 
         if source.get("direct"):
             destination = source["direct"]
@@ -627,16 +651,23 @@ def resolve_sources(url: str, quality_id: str) -> List[Dict[str, Any]]:
             else:
                 file_id = interstitial.get("file_id")
                 host_name = host or interstitial.get("host") or ""
-                if file_id:
+                domain = interstitial.get("host") or None
+                if host_name:
                     host_known = True
-                    result = toonworld_hosts.resolve(
-                        host_name, file_id, referer=url
-                    )
-                    destination = result.url
-                    state = result.state
-                    detail = result.detail
-                    kind = result.kind
-                    extra = result.extra
+                if file_id:
+                    problem = validate_host_id(host_name, file_id)
+                    if problem:
+                        state = "missing"
+                        detail = problem
+                    else:
+                        result = toonworld_hosts.resolve(
+                            host_name, file_id, referer=url, domain=domain
+                        )
+                        destination = result.url
+                        state = result.state
+                        detail = result.detail
+                        kind = result.kind
+                        extra = result.extra
                 else:
                     detail = "the download page did not expose a file id"
 
@@ -645,13 +676,20 @@ def resolve_sources(url: str, quality_id: str) -> List[Dict[str, Any]]:
                 browser_links = _browser_links_for_sources(quality, url)
             entry = browser_links.get(token) or {}
             links = entry.get("links") or []
-            if links:
-                replacement = _match_browser_link(links, host, token)
-                if replacement:
+            replacement = _match_browser_link(links, host, token) if links else None
+            if replacement:
+                replacement_problem = validate_host_id(
+                    replacement.get("host") or "", replacement.get("file_id") or ""
+                )
+                if replacement_problem:
+                    state = "missing"
+                    detail = replacement_problem
+                else:
                     result = toonworld_hosts.resolve(
                         replacement["host"],
                         replacement["file_id"],
                         referer=url,
+                        domain=_host_domain(replacement.get("url") or ""),
                     )
                     destination = result.url
                     state = result.state
@@ -662,6 +700,10 @@ def resolve_sources(url: str, quality_id: str) -> List[Dict[str, Any]]:
                 detail = f"{detail}; {entry['error']}"
             elif entry.get("error"):
                 detail = entry["error"]
+            elif not links:
+                reason = _browser_fallback_reason()
+                if reason:
+                    detail = f"{detail}; {reason}" if detail else reason
 
         if destination and state == "ready" and kind != "mega":
             status = probe_destination(destination)
@@ -753,6 +795,24 @@ def _cached_browser_links(token: str) -> Optional[Dict[str, Any]]:
 
 def _cache_browser_links(token: str, links: Dict[str, Any]) -> None:
     _BROWSER_LINK_CACHE[token] = (time.monotonic(), dict(links))
+
+
+def _host_domain(url: str) -> Optional[str]:
+    """Return the host of a file page so the resolver can use that domain."""
+    match = re.match(r"https?://([^/]+)", url or "", re.I)
+    return match.group(1) if match else None
+
+
+def _browser_fallback_reason() -> str:
+    """Explain why the browser fallback could not run."""
+    from . import browser as browser_module
+
+    if not browser_module.browser_available():
+        return (
+            "the browser fallback is not available on this deployment, "
+            "so the file id could not be picked up from the rendered page"
+        )
+    return "the browser fallback did not find a file link on the rendered page"
 
 
 def _match_browser_link(

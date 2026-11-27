@@ -1,5 +1,63 @@
 # Progress
 
+## 2026-11-27 - toonworld browser fallback, host domains and job cancel
+
+### Modules
+
+| Module | What it does | State |
+|---|---|---|
+| `app/sources/toonworld_hosts.py` | Host resolvers; every resolver now takes the domain the archive stored (`link.domain`) and falls back to the known domain | done |
+| `app/sources/toonworld.py` | Host matching by name (`HubCloud`, `hubcloud.mov`, `https://hubcloud.mov/drive/`), id validation per host and the browser fallback | done |
+| `app/jobs.py` | A deleted job stops its worker, is not written to the history again, and a late cancel removes the finished file | done |
+| `app/ytdlp_client.py` | The post-processing step honours a cancel, and the cleanup catches `.part-Frag*`, `.ytdl`, `.temp.*` and `.f<id>.*` leftovers | done |
+
+### Endpoints
+
+| Endpoint | Change |
+|---|---|
+| `DELETE /api/jobs/{id}` | A running job is now stopped before it is forgotten; the partial files are removed and the job stays gone |
+| `POST /api/jobs/{id}/cancel` | A cancel that arrives after the file was written removes that file instead of leaving it behind |
+
+### Fixes on this date
+
+- The host of a browser found link is matched by name, so `hubcloud.mov` and
+  `https://hubcloud.mov/drive/` resolve to the same resolver. Before this the
+  browser fallback rejected its own result and the job ended with an error.
+- The browser fallback is now used whenever the direct route fails: no file id
+  on the redirect page, a placeholder id the host rejects, or a link that does
+  not serve a file.
+- The resolvers use the domain the archive stored instead of a hard coded one,
+  so a host that moved keeps working.
+- A MEGA id without its decryption key is reported as an incomplete link
+  instead of a generic HTTP error, and a FilePress id that is not a 24
+  character hexadecimal object id is named as such.
+- A deleted job keeps no worker behind: the download thread stops, the
+  `.part` file disappears and the job does not come back through the history.
+
+### Tests
+
+- `tests/test_jobs_cancel.py` (new) locks the cancel and delete behaviour in
+  place: the worker stops, the partial files are removed, a late cancel
+  deletes the finished file and a removed job stays out of the history.
+- `tests/test_toonworld.py` covers the host matching, the id validation and
+  the browser fallback for a missing, a placeholder and a working file id.
+- The whole suite is green: 111 passed, 2 skipped.
+
+### Live state from this machine
+
+- A 1 GB job was deleted while it was downloading: the job answered `404`
+  right after the delete, the partial file was removed and no new bytes
+  arrived.
+- The browser fallback was verified end to end against a local HTTPS server
+  that mimics the archive, the shortener and the file host: Chromium rendered
+  the interstitial, followed the shortener, picked up the host link and the
+  resolver returned the media URL.
+- Against the live site the shortener still shows a Cloudflare checkbox that
+  does not clear on its own, so the job ends with that reason. The stored ids
+  are dead on the hosts as well (`HubCloud` answers `404`, Filepress answers
+  `Invaild File ID`), which is why the browser route is the only way to the
+  real link.
+
 ## 2026-11-27 - Render hosting, cold start and memory ceiling
 
 The service is now shaped for a 512 MB Render instance: it boots in about

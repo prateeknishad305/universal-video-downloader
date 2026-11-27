@@ -72,6 +72,7 @@ class Job:
     updated_at: float = field(default_factory=time.time)
     version: int = 0
     cancel_requested: bool = False
+    removed: bool = False
     logs: List[str] = field(default_factory=list)
 
     # -- mutations -------------------------------------------------------- #
@@ -136,6 +137,8 @@ class JobManager:
     # -- persistence ------------------------------------------------------ #
     def _persist(self, job: Job) -> None:
         """Mirror a job snapshot into the history store (never blocks)."""
+        if job.removed:
+            return
         snapshot = job.to_dict()
         try:
             loop = asyncio.get_running_loop()
@@ -337,6 +340,8 @@ class JobManager:
                 if space_problem:
                     raise RuntimeError(space_problem)
 
+                finished_path: Optional[Path] = None
+
                 path: Path = await asyncio.to_thread(
                     download_media,
                     job.url,
@@ -348,8 +353,11 @@ class JobManager:
                     on_log=on_log,
                     should_cancel=should_cancel,
                 )
+                finished_path = path
 
                 with self._lock:
+                    if job.cancel_requested:
+                        raise CancelledError("Download cancelled by the user.")
                     job.filepath = str(path)
                     job.filename = path.name
                     job.status = "completed"
@@ -363,6 +371,11 @@ class JobManager:
 
             except CancelledError:
                 remove_partial_files(config.DOWNLOAD_DIR, stem)
+                if finished_path is not None:
+                    try:
+                        finished_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 self._finish_cancelled(job)
             except Exception as exc:  # noqa: BLE001 - surfaced to the UI
                 remove_partial_files(config.DOWNLOAD_DIR, stem)
@@ -398,14 +411,16 @@ class JobManager:
 
     def remove(self, job_id: str, delete_file: bool = False) -> bool:
         with self._lock:
-            job = self._jobs.pop(job_id, None)
-            task = self._tasks.pop(job_id, None)
-        if job is None:
-            return False
-        if job.status not in TERMINAL_STATES:
-            self.cancel(job_id)
-        if task is not None and not task.done():
-            task.cancel()
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            job.removed = True
+            if job.status not in TERMINAL_STATES:
+                job.cancel_requested = True
+                job.stage = "Cancelling..."
+                job.touch()
+            self._jobs.pop(job_id, None)
+            self._tasks.pop(job_id, None)
         if delete_file and job.filepath:
             try:
                 Path(job.filepath).unlink(missing_ok=True)
