@@ -101,9 +101,9 @@ def _quality_lookup(analysis: Dict[str, Any], quality_id: str) -> Dict[str, Any]
     return {
         "id": "best",
         "label": "Best available",
-        "selector": "best",
+        "selector": "bestvideo+bestaudio/best",
         "kind": "combined",
-        "requires_merge": False,
+        "requires_merge": True,
     }
 
 
@@ -116,6 +116,8 @@ def _quality_lookup(analysis: Dict[str, Any], quality_id: str) -> Dict[str, Any]
 async def health() -> Dict[str, Any]:
     import shutil
 
+    from .sources import browser as browser_module
+
     return {
         "ok": True,
         "yt_dlp_version": yt_dlp.version.__version__,
@@ -127,6 +129,8 @@ async def health() -> Dict[str, Any]:
         "storage": "mongodb" if config.MONGO_URI else "memory",
         "telegram": bool(config.TELEGRAM_BOT_TOKEN),
         "impersonation": config.IMPERSONATION_AVAILABLE,
+        "browser": browser_module.browser_available(),
+        "browser_path": browser_module.chromium_path(),
     }
 
 

@@ -162,9 +162,9 @@ class JobManager:
             quality = {
                 "id": "best",
                 "label": "Best available",
-                "selector": "best",
+                "selector": "bestvideo+bestaudio/best",
                 "kind": "combined",
-                "requires_merge": False,
+                "requires_merge": True,
             }
 
         effective_mode = mode

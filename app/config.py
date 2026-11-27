@@ -57,5 +57,23 @@ try:  # pragma: no cover - depends on the environment
 except Exception:  # pragma: no cover
     IMPERSONATION_AVAILABLE = False
 
+# Browser automation (Playwright) is used for links that are gated behind a
+# JavaScript challenge.  The browser profile is kept between runs so that a
+# clearance cookie survives a restart.
+BROWSER_EXECUTABLE = (os.environ.get("UVD_BROWSER_EXECUTABLE") or "").strip() or None
+BROWSER_HEADLESS = (os.environ.get("UVD_BROWSER_HEADLESS") or "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+BROWSER_TIMEOUT_MS = int(os.environ.get("UVD_BROWSER_TIMEOUT_MS", "45000"))
+BROWSER_PROFILE_DIR = Path(
+    os.environ.get("UVD_BROWSER_PROFILE") or (DATA_DIR / "browser-profile")
+).resolve()
+
+# A downloaded file smaller than this is treated as a placeholder instead of
+# the requested media.  ffprobe checks the content on top of that.
+MIN_MEDIA_BYTES = int(os.environ.get("UVD_MIN_MEDIA_BYTES", str(16 * 1024)))
+
 DEFAULT_HOST = os.environ.get("HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("PORT", "8000"))

@@ -200,14 +200,20 @@ app/
   storage.py        Job history: MongoDB store with an in-memory fallback
   telegram_bot.py   Telegram bot front end (long polling)
   sources/
-    http.py         HTTP helper with browser impersonation
-    toonworld.py    Native toonworld4all.me extractor
+    http.py             HTTP helper with browser impersonation
+    browser.py          Chromium session (Playwright) for JavaScript challenges
+    mega.py             MEGA API client and AES-128-CTR decryption
+    toonworld.py        Native toonworld4all.me extractor
+    toonworld_hosts.py  Filepress, GDFlix, HubCloud, MEGA and AppDrive resolvers
 static/
   index.html        Single-page UI
   styles.css        Dark theme
   app.js            Front-end logic (SSE + polling fallback)
 tests/
-  test_api.py       Offline test suite (no network required)
+  test_api.py              Offline test suite (no network required)
+  test_toonworld.py        Episode, season and token parsing
+  test_toonworld_hosts.py  Host resolvers
+  test_toonworld_resolution.py  Resolution pipeline and download checks
 ```
 
 ---
@@ -235,7 +241,8 @@ refuses to write anything under `.github/workflows`.)
 ```
 
 The suite runs entirely offline — yt-dlp is stubbed out — so it never depends on
-a live site being reachable.
+a live site being reachable. It currently reports **85 passed, 2 skipped** (the
+skipped tests need `ffmpeg`/`ffprobe`).
 
 ---
 
@@ -325,57 +332,86 @@ are encrypted.
 
    Each tier carries the files offered for it on four hosts
    (HubCloud, Filepress, GDFlix, MEGA).
-3. Every host is resolved and **health-checked** before the download starts.
-   The downloader then tries each host in turn and reports precisely why a
-   host was skipped.
+3. Every host is resolved through its **own resolver** and health-checked
+   before the download starts. The downloader then tries each host in turn and
+   reports precisely why a host was skipped.
 
 **How the redirect tokens are decoded**
 
-Each file link is an encrypted `/redirect/<token>`. The archive app decodes
-it server-side and shows the destination on an interstitial page — but only
-for a visitor that has no session cookie yet. A second request with the same
-session is bounced to the ad shortener instead, so every token is resolved
-with a *fresh* session.
+Each file link is an encrypted `/redirect/<token>`. The archive app decodes it
+server-side and answers with an interstitial page that carries
+
+* `link.domain` — the host the file lives on (`https://hubcloud.mov/drive/`),
+* `link.hidden` — the file id on that host,
+* `destination` — the ad shortener that guards the real links.
+
+The interstitial is only shown to a visitor without a session cookie; a
+second request with the same session is bounced to the shortener, so every
+token is resolved with a *fresh* session.
+
+**Host resolvers**
+
+| Host | How the file is resolved |
+|---|---|
+| Filepress | `GET /api/file/get/<id>` returns the file description including `downloadUrl` |
+| GDFlix | the server-rendered file page carries the Google Drive link, which yt-dlp downloads |
+| HubCloud | the JavaScript challenge is answered, then `api/downloader.php` returns the file URL |
+| MEGA | the file key is used with the MEGA API; the payload is decrypted with AES-128-CTR |
+| AppDrive | the JavaScript redirect chain is followed to the real file |
+
+**The shortener**
+
+The ids the archive stores are placeholders: the hosts answer *"the file does
+not exist"*. The real links are behind the ad shortener of the interstitial.
+When that happens the downloader opens a **real Chromium session**
+(Playwright), lets the shortener run its own JavaScript and picks up the host
+links the shortener hands out. Verification widgets are never clicked; the
+page is only given the chance to verify itself, and when it does not, the job
+reports that instead of pretending the file was downloaded.
 
 **Cloudflare**
 
 Both `toonworld4all.me` and `archive.toonworld4all.me` sit behind Cloudflare's
 bot detection. The app uses `curl_cffi` to present a genuine Chrome TLS/HTTP
-fingerprint, which clears the challenge without needing a headless browser.
+fingerprint, which clears the challenge without needing a browser.
 
-**Host health check**
+**Placeholder protection**
 
-Every host is probed before a download starts, and the job log reports exactly
-why a host was skipped. This is what the downloader reports for the current
-Naruto: Shippuden season 18 links:
+A host that answers with a placeholder instead of the episode is detected:
+the finished file is checked against `UVD_MIN_MEDIA_BYTES` (16 KiB by
+default), against the `video-bytes` marker some hosts return, against the size
+the archive announced for the tier, and with `ffprobe` so only a file with
+real media streams passes. A placeholder is treated as a failed host, so the
+download moves on to the next host instead of handing an 11 byte file to the
+user.
 
-| Host | Reported status | What it means |
-|---|---|---|
-| HubCloud | `the host says the file does not exist` | `hubcloud.mov` answers `404 ! File Not Found`; the domain now redirects to `hubcloud.foo`, which is a parked domain |
-| Filepress | `invalid FilePress id '<id>' - FilePress only accepts a 24 character hexadecimal object id` | The archive stores legacy nanoid ids; FilePress moved to MongoDB object ids |
-| GDFlix | `the host says the file was removed` | `gdflix.dev` replies *"The file you are trying to download is no longer available!"* |
-| MEGA | `invalid MEGA handle '<id>' (52 chars) - MEGA file handles are 22 characters` | The stored handle is not a MEGA handle, so MEGA serves its landing page |
+**Browser settings**
 
-The same pattern was verified across 12 episodes from 10 different shows
-(One Piece, Bleach, Attack on Titan, Dragon Ball Super, Hunter × Hunter,
-Demon Slayer, …), so it is a **site-side data problem**, not a downloader
-problem: the stored file links are stale.
+| Variable | Meaning |
+|---|---|
+| `UVD_BROWSER_EXECUTABLE` | Path of the Chromium build, when it is not in a usual place |
+| `UVD_BROWSER_HEADLESS` | `1` (default) runs the browser without a window, `0` shows it |
+| `UVD_BROWSER_PROFILE` | Directory that keeps the cookies a challenge hands out |
+| `UVD_BROWSER_TIMEOUT_MS` | How long the browser waits for a page |
 
-**How to fix the links**
+The browser is optional: without it the downloader still resolves every host
+that does not need a JavaScript challenge.
 
-Any of these makes the downloader work immediately — no code change needed:
+**When the shortener asks for a human check**
 
-1. **Host the files yourself.** Put them under `wp-content/uploads/` and store
-   the plain URL in the episode's file list. The extractor uses absolute URLs
-   as-is (a direct file link never goes through the redirect decoder).
-2. **Re-point at a host with the current id format** — a 24 character hex
-   object id for FilePress, a 22 character handle for MEGA.
-3. **Flip `redirect.direct` to `true`** in the archive app config. The
-   interstitial page with the ad-shortener choice then disappears and the
-   redirect points straight at the file.
+Some networks make the shortener show a Cloudflare checkbox that never clears
+by itself. The downloader never clicks it. In that case the job ends with the
+reason per host, for example:
 
-The downloader also fails over automatically: if one host is dead it moves to
-the next, so a single stale host never blocks a download.
+```
+Every download host failed for this episode. HubCloud: the host page did not
+expose a direct file URL (the archive id looks like a placeholder) | Filepress:
+Invaild File ID; the ad shortener asks for a Cloudflare verification that did
+not complete on its own | ...
+```
+
+No file is written in that case. `/api/health` reports the Chromium build the
+browser route would use (`browser`, `browser_path`).
 
 ---
 

@@ -13,6 +13,8 @@ library into three predictable operations:
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -96,6 +98,16 @@ class CollectingLogger:
             pass
 
 
+def _impersonate_target(name: str) -> Any:
+    """Build the structured impersonation target yt-dlp expects."""
+    try:
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+
+        return ImpersonateTarget.from_str(name)
+    except Exception:
+        return None
+
+
 def base_opts(impersonate: Optional[str] = None) -> Dict[str, Any]:
     """Common yt-dlp options shared by probing and downloading."""
     opts: Dict[str, Any] = {
@@ -113,7 +125,9 @@ def base_opts(impersonate: Optional[str] = None) -> Dict[str, Any]:
         "overwrites": False,
     }
     if impersonate and config.IMPERSONATION_AVAILABLE:
-        opts["impersonate"] = impersonate
+        target = _impersonate_target(impersonate)
+        if target is not None:
+            opts["impersonate"] = target
     if config.PROXY:
         opts["proxy"] = config.PROXY
     if config.COOKIES_FILE:
@@ -184,17 +198,27 @@ def build_quality_ladder(formats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         key=lambda f: (f.get("height") or 0, f.get("tbr") or 0),
         default=None,
     )
+    best_video = max(
+        (f for f in formats if f.get("vcodec") not in (None, "none")),
+        key=lambda f: (f.get("height") or 0, f.get("tbr") or 0),
+        default=None,
+    )
+    best_height = (best_combined or best_video or {}).get("height")
+    best_size = (best_combined or {}).get("filesize") or (
+        (_best_video_size(formats, best_height) + _best_audio_size(formats)) or None
+    )
     ladder.append(
         {
             "id": "best",
             "label": "Best quality (original file, no re-encode)",
-            "hint": "Picks the single highest-quality file the site provides.",
-            "selector": "best",
+            "hint": "Picks the highest quality the site provides, merging video and audio with "
+            "ffmpeg when the site delivers them separately.",
+            "selector": "bestvideo+bestaudio/best",
             "kind": "combined",
-            "height": (best_combined or {}).get("height"),
-            "hdr": (best_combined or {}).get("dynamic_range") not in (None, "SDR"),
-            "size": (best_combined or {}).get("filesize"),
-            "requires_merge": False,
+            "height": best_height,
+            "hdr": (best_combined or best_video or {}).get("dynamic_range") not in (None, "SDR"),
+            "size": best_size,
+            "requires_merge": best_combined is None,
         }
     )
 
@@ -483,27 +507,126 @@ def _download_toonworld(
         if on_log:
             on_log("info", f"Trying {host}: {destination}")
         try:
-            return _download_direct(
-                destination,
-                outtmpl=outtmpl,
-                selector="best",
-                mode=mode,
-                subtitles=subtitles,
-                on_progress=on_progress,
-                on_log=on_log,
-                should_cancel=should_cancel,
-                impersonate="chrome",
-            )
+            if source.get("kind") == "mega":
+                path = _download_mega(source, outtmpl=outtmpl, on_log=on_log)
+            else:
+                path = _download_direct(
+                    destination,
+                    outtmpl=outtmpl,
+                    selector="bestvideo+bestaudio/best",
+                    mode=mode,
+                    subtitles=subtitles,
+                    on_progress=on_progress,
+                    on_log=on_log,
+                    should_cancel=should_cancel,
+                    impersonate="chrome",
+                )
+            problem = verify_media_file(path, source.get("expected_size"))
+            if problem:
+                raise DownloadError(problem)
+            return path
         except CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             message = str(exc).strip() or exc.__class__.__name__
+            if "Unsupported URL" in message:
+                message = (
+                    "the host page did not expose a direct file URL "
+                    "(the archive id looks like a placeholder)"
+                )
             failures.append(f"{host}: {message}")
             if on_log:
                 on_log("warning", f"{host} failed: {message}")
 
     detail = " | ".join(failures) if failures else "no hosts were offered"
     raise DownloadError(f"Every download host failed for this episode. {detail}")
+
+
+def verify_media_file(path: Path, expected_size: Optional[int] = None) -> Optional[str]:
+    """Return a complaint when *path* is not a usable media file."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return f"the downloaded file could not be read: {exc}"
+    if expected_size and size < expected_size * 0.05:
+        return (
+            f"the host returned {size} bytes instead of the {expected_size} bytes "
+            "the archive announced"
+        )
+    if size < config.MIN_MEDIA_BYTES:
+        return (
+            f"the host returned a placeholder of {size} bytes instead of the episode"
+        )
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(64)
+    except OSError:
+        head = b""
+    if head.startswith(b"video-bytes"):
+        return "the host returned a placeholder instead of the episode"
+    problem = _probe_media_file(path)
+    if problem:
+        return problem
+    return None
+
+
+def _probe_media_file(path: Path) -> Optional[str]:
+    """Check with ffprobe that the file really holds media."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration,format_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return "the downloaded file could not be read as media"
+    output = (completed.stdout or b"").decode("utf-8", "replace").strip()
+    if not output:
+        return "the downloaded file holds no media"
+    return None
+
+
+def _download_mega(
+    source: Dict[str, Any],
+    *,
+    outtmpl: str,
+    on_log: Optional[Callable[[str, str], None]] = None,
+) -> Path:
+    """Download a MEGA file through the MEGA API."""
+    from .sources import mega
+
+    extra = source.get("extra") or {}
+    handle = extra.get("handle")
+    key = extra.get("key")
+    if not handle or not key:
+        raise DownloadError("the MEGA link did not carry a file key")
+
+    template = Path(outtmpl)
+    name = template.name
+    if "{ext}" in name:
+        name = name.replace("{ext}", "mp4")
+    target = template.with_name(name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if on_log:
+        on_log("info", f"Downloading from MEGA: {handle}")
+    mega.download(handle, key, str(target))
+    return target
+
 
 
 def _download_direct(
