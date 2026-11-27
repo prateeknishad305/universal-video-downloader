@@ -19,9 +19,6 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import yt_dlp
-from yt_dlp.utils import DownloadError
-
 from . import config
 from .sources import multimovies, toonworld
 
@@ -34,6 +31,29 @@ __all__ = [
     "detect_extractor",
     "safe_filename",
 ]
+
+_yt_dlp_module: Any = None
+_download_error_class: Any = None
+
+
+def _yt_dlp() -> Any:
+    """Import yt-dlp on first use so the service starts fast."""
+    global _yt_dlp_module
+    if _yt_dlp_module is None:
+        import yt_dlp as module
+
+        _yt_dlp_module = module
+    return _yt_dlp_module
+
+
+def _download_error() -> Any:
+    """The exception class yt-dlp raises for a failed download."""
+    global _download_error_class
+    if _download_error_class is None:
+        from yt_dlp.utils import DownloadError
+
+        _download_error_class = DownloadError
+    return _download_error_class
 
 
 class CancelledError(Exception):
@@ -123,7 +143,10 @@ def base_opts(impersonate: Optional[str] = None) -> Dict[str, Any]:
         "concurrent_fragment_downloads": 4,
         "continuedl": True,
         "overwrites": False,
+        "cachedir": False,
     }
+    if config.MAX_FILE_MB > 0:
+        opts["max_filesize"] = config.MAX_FILE_MB * 1024 * 1024
     if impersonate and config.IMPERSONATION_AVAILABLE:
         # The Python API expects an ImpersonateTarget object; the command line
         # converts the plain string for us.
@@ -364,7 +387,7 @@ def analyze(url: str) -> Dict[str, Any]:
             try:
                 return source.probe(url)
             except Exception as exc:  # noqa: BLE001
-                raise DownloadError(str(exc)) from exc
+                raise _download_error()(str(exc)) from exc
 
     opts = base_opts()
     opts.update(
@@ -376,9 +399,9 @@ def analyze(url: str) -> Dict[str, Any]:
     )
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with _yt_dlp().YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    except DownloadError as exc:
+    except _download_error() as exc:
         message = str(exc)
         if "Unsupported URL" in message:
             raise UnsupportedSiteError(
@@ -388,7 +411,7 @@ def analyze(url: str) -> Dict[str, Any]:
         raise
 
     if not info:
-        raise DownloadError("No information could be extracted from that URL.")
+        raise _download_error()("No information could be extracted from that URL.")
 
     # --- playlist / album / channel ------------------------------------- #
     if info.get("_type") in {"playlist", "multi_video"} or "entries" in info:
@@ -536,7 +559,7 @@ def _download_source_list(
             if source.get("expected_size") is not None:
                 problem = verify_media_file(path, source.get("expected_size"))
                 if problem:
-                    raise DownloadError(problem)
+                    raise _download_error()(problem)
             return path
         except CancelledError:
             raise
@@ -575,7 +598,7 @@ def _download_source_list(
                 on_log("warning", f"{host} failed: {message}")
 
     detail = " | ".join(failures) if failures else "no sources were offered"
-    raise DownloadError(f"Every download source failed for this item. {detail}")
+    raise _download_error()(f"Every download source failed for this item. {detail}")
 
 
 def _download_multimovies(
@@ -700,7 +723,7 @@ def _download_mega(
     handle = extra.get("handle")
     key = extra.get("key")
     if not handle or not key:
-        raise DownloadError("the MEGA link did not carry a file key")
+        raise _download_error()("the MEGA link did not carry a file key")
 
     template = Path(outtmpl)
     name = template.name
@@ -806,6 +829,8 @@ def _download_direct(
         # codecs, instead of failing the whole download.
         opts["merge_output_format"] = "mp4/mkv"
 
+    opts["postprocessor_args"] = {"ffmpeg": ["-threads", str(config.FFMPEG_THREADS)]}
+
     if referer:
         # Streaming hosts block requests that do not come from their player.
         headers = dict(opts.get("http_headers") or {})
@@ -829,12 +854,12 @@ def _download_direct(
             }
         )
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with _yt_dlp().YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
     final_path = _resolve_final_path(info, finished)
     if final_path is None or not final_path.exists():
-        raise DownloadError("The download finished but no output file could be located.")
+        raise _download_error()("The download finished but no output file could be located.")
     return final_path
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 
@@ -50,16 +51,16 @@ TELEGRAM_MAX_UPLOAD_MB = int(os.environ.get("TELEGRAM_MAX_UPLOAD_MB") or "50")
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or "").strip().rstrip("/")
 
 # Browser impersonation (curl_cffi) clears most Cloudflare challenges.
-try:  # pragma: no cover - depends on the environment
-    import curl_cffi  # noqa: F401
-
-    IMPERSONATION_AVAILABLE = True
-except Exception:  # pragma: no cover
-    IMPERSONATION_AVAILABLE = False
+IMPERSONATION_AVAILABLE = importlib.util.find_spec("curl_cffi") is not None
 
 # Browser automation (Playwright) is used for links that are gated behind a
 # JavaScript challenge.  The browser profile is kept between runs so that a
 # clearance cookie survives a restart.
+BROWSER_ENABLED = (os.environ.get("UVD_BROWSER_ENABLED") or "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 BROWSER_EXECUTABLE = (os.environ.get("UVD_BROWSER_EXECUTABLE") or "").strip() or None
 BROWSER_HEADLESS = (os.environ.get("UVD_BROWSER_HEADLESS") or "1").strip().lower() not in {
     "0",
@@ -74,6 +75,22 @@ BROWSER_PROFILE_DIR = Path(
 # A downloaded file smaller than this is treated as a placeholder instead of
 # the requested media.  ffprobe checks the content on top of that.
 MIN_MEDIA_BYTES = int(os.environ.get("UVD_MIN_MEDIA_BYTES", str(16 * 1024)))
+
+# Largest file the downloader accepts, in MB.  0 means no limit.
+MAX_FILE_MB = int(os.environ.get("UVD_MAX_FILE_MB", "0"))
+
+# How many finished jobs are kept in memory before the oldest ones are dropped.
+MAX_HISTORY_JOBS = int(os.environ.get("UVD_MAX_HISTORY_JOBS", "200"))
+
+# Free space (MB) that has to stay available for a new download to start.
+MIN_FREE_DISK_MB = int(os.environ.get("UVD_MIN_FREE_DISK_MB", "0"))
+
+# How many threads ffmpeg may use.  A small container runs out of memory when
+# ffmpeg decodes with every core it can see.
+FFMPEG_THREADS = max(1, int(os.environ.get("UVD_FFMPEG_THREADS", "2")))
+
+# The host the service runs on, used for the public links in the answers.
+RENDER = bool(os.environ.get("RENDER"))
 
 DEFAULT_HOST = os.environ.get("HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("PORT", "8000"))

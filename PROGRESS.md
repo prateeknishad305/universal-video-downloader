@@ -1,5 +1,65 @@
 # Progress
 
+## 2026-11-27 - Render hosting, cold start and memory ceiling
+
+The service is now shaped for a 512 MB Render instance: it boots in about
+0.7 s, answers the health check without a token and stays around 110 MB of
+RAM while a download runs. The upstream work (multimovies, embed resolvers)
+was merged into the local toonworld branch, so both features are in one tree.
+
+### Modules
+
+| Module | What it does | State |
+| --- | --- | --- |
+| `app/config.py` | Render block, browser switch, file size cap, history limit, free disk guard, ffmpeg thread cap, `curl_cffi` detection | done |
+| `app/ytdlp_client.py` | Lazy yt-dlp import, `cachedir: False`, `max_filesize`, ffmpeg thread args, MEGA failover, placeholder check | done |
+| `app/main.py` | Public `/api/health`, lazy Telegram import, version from `importlib.metadata` | done |
+| `app/jobs.py` | `_trim_jobs()` keeps the job list bounded, `_disk_space_problem()` guards new downloads | done |
+| `app/sources/browser.py` | Browser route can be switched off with `UVD_BROWSER_ENABLED=0` | done |
+| `app/storage.py` | pymongo is imported only when a Mongo URI is set | done |
+| `Dockerfile` | Slim image, optional Chromium build, memory friendly environment, non-root user, health check | done |
+| `render.yaml` | Blueprint: docker runtime, `/api/health`, `/data` disk, Mongo, generated `API_TOKEN` | done |
+| `Procfile` | `uvicorn` with `--proxy-headers` and a keep-alive timeout | done |
+| `requirements-browser.txt` | Playwright, kept out of the core requirements | done |
+| `run.sh` | Installs the browser requirements only when the browser route is on | done |
+
+### Endpoints
+
+| Endpoint | Method | Answer | State |
+| --- | --- | --- | --- |
+| `/api/health` | GET | Public on Render; version, ffmpeg, browser, `max_file_mb`, `free_disk_mb`, `render` | done |
+| `/api/sites` | GET | The supported sites, token protected outside of health | done |
+| `/api/jobs` | POST | A download job, size capped by `UVD_MAX_FILE_MB` | done |
+| `/api/jobs/{job_id}` | GET | One job, `UVD_MAX_HISTORY_JOBS` keeps the list short | done |
+| `/api/jobs/{job_id}/file` | GET | The finished file | done |
+
+### Settings
+
+| Variable | Meaning |
+| --- | --- |
+| `UVD_BROWSER_ENABLED` | `0` keeps Chromium out of the process |
+| `UVD_MAX_FILE_MB` | Largest file yt-dlp may fetch, `0` means no limit |
+| `UVD_MAX_HISTORY_JOBS` | How many finished jobs stay in memory |
+| `UVD_MIN_FREE_DISK_MB` | Free space that has to remain before a download starts |
+| `UVD_FFMPEG_THREADS` | Threads ffmpeg may use while merging |
+
+### Tests
+
+- `pytest -q` - 97 passed, 2 skipped (also green without Playwright installed).
+- `merge_threads_test.py` - ffmpeg still merges a video and an audio stream
+  with `-threads 2`: the result holds one `h264` video and one `aac` audio
+  stream.
+
+### Live state from this machine
+
+- A Render-like run (`RENDER=1`, one worker, browser off) answered
+  `/api/health` without a token, listed 1751 sites with the token and finished
+  a download of 5485935 bytes that `ffprobe` reads as 10.24 seconds.
+- The peak memory of that run was 109 MB, the import of the app 0.661 s with
+  yt-dlp, Telegram and pymongo still unimported.
+- Docker is not installed in this box, so the image was reviewed by hand and
+  not built here.
+
 ## 2026-11-26 - toonworld4all.me download path
 
 The native toonworld support was rebuilt around the way the archive actually

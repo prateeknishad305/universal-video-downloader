@@ -12,11 +12,6 @@ import logging
 import threading
 from typing import Any, Dict, List, Optional
 
-try:  # pragma: no cover - the driver is an optional dependency
-    from pymongo import ASCENDING
-except Exception:  # pragma: no cover
-    ASCENDING = 1  # type: ignore[assignment]
-
 log = logging.getLogger(__name__)
 
 TERMINAL_STATES = ("completed", "error", "cancelled")
@@ -108,7 +103,7 @@ class MongoJobStore(JobStore):
     ) -> None:
         self._client = client
         if self._client is None:
-            from pymongo import MongoClient
+            from pymongo import ASCENDING, MongoClient
 
             self._client = MongoClient(
                 uri,
@@ -118,6 +113,9 @@ class MongoJobStore(JobStore):
             )
             # Fail fast when the server is unreachable.
             self._client.admin.command("ping")
+        else:
+            from pymongo import ASCENDING
+
         self._collection = self._client[database][collection]
         self._collection.create_index([("created_at", ASCENDING)])
         self._collection.create_index("id", unique=True)

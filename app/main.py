@@ -8,16 +8,16 @@ import logging
 import mimetypes
 import time
 from contextlib import asynccontextmanager
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import yt_dlp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, telegram_bot, ytdlp_client
+from . import config, ytdlp_client
 from .jobs import JobManager
 from .models import AnalyzeRequest, BatchJobRequest, JobRequest
 from .storage import build_store
@@ -29,12 +29,22 @@ store = build_store(config.MONGO_URI, config.MONGO_DB, config.MONGO_COLLECTION)
 manager = JobManager(store=store)
 
 
+def _package_version(name: str) -> str:
+    """Read a package version without importing the package."""
+    try:
+        return metadata.version(name)
+    except Exception:
+        return "unknown"
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """Start the optional Telegram bot and clean up on shutdown."""
     application.state.telegram = None
     if config.TELEGRAM_BOT_TOKEN:
         try:
+            from . import telegram_bot
+
             application.state.telegram = await telegram_bot.start_bot(
                 manager, web_url=config.PUBLIC_URL
             )
@@ -43,7 +53,12 @@ async def lifespan(application: FastAPI):
     try:
         yield
     finally:
-        await telegram_bot.stop_bot(getattr(application.state, "telegram", None))
+        try:
+            from . import telegram_bot
+
+            await telegram_bot.stop_bot(getattr(application.state, "telegram", None))
+        except Exception:  # pragma: no cover
+            pass
         try:
             store.close()
         except Exception:  # pragma: no cover
@@ -69,7 +84,8 @@ app.add_middleware(
 @app.middleware("http")
 async def token_guard(request: Request, call_next):
     """Require ``API_TOKEN`` on API routes when one is configured."""
-    if config.API_TOKEN and request.url.path.startswith("/api/"):
+    path = request.url.path
+    if config.API_TOKEN and path.startswith("/api/") and path != "/api/health":
         supplied = request.headers.get("x-api-token") or request.query_params.get("token")
         if supplied != config.API_TOKEN:
             return JSONResponse(
@@ -118,19 +134,28 @@ async def health() -> Dict[str, Any]:
 
     from .sources import browser as browser_module
 
+    free_bytes = 0
+    try:
+        free_bytes = shutil.disk_usage(str(config.DOWNLOAD_DIR)).free
+    except Exception:  # pragma: no cover - the disk may not be mounted yet
+        free_bytes = 0
+
     return {
         "ok": True,
-        "yt_dlp_version": yt_dlp.version.__version__,
+        "yt_dlp_version": _package_version("yt-dlp"),
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "ffmpeg_path": shutil.which("ffmpeg"),
         "max_concurrent_jobs": config.MAX_CONCURRENT_JOBS,
+        "max_file_mb": config.MAX_FILE_MB,
         "download_dir": str(config.DOWNLOAD_DIR),
+        "free_disk_mb": free_bytes // (1024 * 1024),
         "auth_required": bool(config.API_TOKEN),
         "storage": "mongodb" if config.MONGO_URI else "memory",
         "telegram": bool(config.TELEGRAM_BOT_TOKEN),
         "impersonation": config.IMPERSONATION_AVAILABLE,
         "browser": browser_module.browser_available(),
-        "browser_path": browser_module.chromium_path(),
+        "browser_path": browser_module.chromium_path() if config.BROWSER_ENABLED else None,
+        "render": config.RENDER,
     }
 
 

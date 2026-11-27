@@ -67,6 +67,14 @@ python3 -m venv .venv
 .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
+The browser route needs Playwright and a Chromium build. They are kept out of
+the core requirements because they add 565 MB to the install:
+
+```bash
+.venv/bin/pip install -r requirements-browser.txt
+.venv/bin/python -m playwright install chromium
+```
+
 ### Install ffmpeg
 
 Merging separate video+audio streams and converting to MP3 both need ffmpeg.
@@ -141,6 +149,16 @@ Everything is controlled by environment variables (see `.env.example`):
 | `TELEGRAM_ALLOWED_CHATS` | *(empty)* | Comma separated chat ids allowed to use the bot |
 | `TELEGRAM_MAX_UPLOAD_MB` | `50` | Telegram's own upload limit |
 | `PUBLIC_URL` | *(empty)* | Public base URL, used in bot messages |
+| `UVD_BROWSER_ENABLED` | `1` | Set to `0` to run without the browser route |
+| `UVD_BROWSER_EXECUTABLE` | *(auto)* | Path of the Chromium build |
+| `UVD_BROWSER_HEADLESS` | `1` | `0` shows the browser window |
+| `UVD_BROWSER_PROFILE` | `./data/browser-profile` | Profile that keeps the clearance cookies |
+| `UVD_BROWSER_TIMEOUT_MS` | `45000` | How long the browser waits for a page |
+| `UVD_MIN_MEDIA_BYTES` | `16384` | Below this a file counts as a placeholder |
+| `UVD_MAX_FILE_MB` | `0` | Largest file that may be downloaded, `0` means no limit |
+| `UVD_MAX_HISTORY_JOBS` | `200` | How many finished jobs are kept in memory |
+| `UVD_MIN_FREE_DISK_MB` | `0` | Free space that has to stay for a new download |
+| `UVD_FFMPEG_THREADS` | `2` | Threads ffmpeg may use while merging |
 
 ### Running it on your network
 
@@ -150,6 +168,55 @@ HOST=0.0.0.0 API_TOKEN=$(openssl rand -hex 16) ./run.sh
 
 Then open `http://<your-ip>:8000/?token=<the-token>` once — the app stores the
 token and strips it from the URL.
+
+---
+
+## Hosting on Render
+
+Render runs the app as a Docker service. The repository ships everything that
+is needed: `Dockerfile`, `Procfile` and `render.yaml`.
+
+### 1. The blueprint (fastest)
+
+1. Push the repository to GitHub.
+2. In Render choose **New → Blueprint**, pick the repository and the
+   `render.yaml` at its root.
+3. Render creates the web service, a MongoDB database and a 1 GB disk for the
+   downloads, then deploys.
+
+The blueprint generates an `API_TOKEN`. Pass it as `x-api-token` (or
+`?token=`) on every `/api` call; `/api/health` stays open so the platform can
+check the service.
+
+### 2. A plain Docker service
+
+| Setting | Value |
+|---|---|
+| Runtime | Docker |
+| Dockerfile path | `./Dockerfile` |
+| Health check path | `/api/health` |
+| Instance type | Starter (512 MB) or better |
+
+### What keeps it fast and out of the OOM killer
+
+| Measure | Why |
+|---|---|
+| `UVD_BROWSER_ENABLED=0` by default in the image | Chromium alone needs about 500 MB; without it the service stays near 110 MB |
+| Playwright is not part of `requirements.txt` | The image stays small and the install stays quick. Build with `--build-arg INSTALL_BROWSER=1` when the browser route is wanted |
+| One uvicorn worker, no `--workers` | Every worker copies the whole Python heap |
+| `MAX_CONCURRENT_JOBS=1` | One download, one ffmpeg merge, one memory spike |
+| `UVD_MAX_FILE_MB=2048` | yt-dlp refuses a file bigger than the cap, so the disk cannot fill up |
+| `UVD_MIN_FREE_DISK_MB=256` | A download refuses to start when the disk is nearly full |
+| `UVD_FFMPEG_THREADS=2` | ffmpeg stops from spawning a thread per core, which is what usually kills a small container |
+| `UVD_MAX_HISTORY_JOBS=200` | The in-memory job list cannot grow without a limit |
+| yt-dlp cache switched off (`cachedir: False`) | No growing cache directory in the container |
+| `PYTHONMALLOC=malloc`, `MALLOC_ARENA_MAX=2`, `OMP_NUM_THREADS=1` | Fewer and smaller memory arenas |
+| Lazy imports | yt-dlp, Telegram and pymongo are only imported when they are used, so the container answers the health check in about 0.7 s |
+| `dumb-init` and `--proxy-headers` | Correct signal handling and the real client IP behind Render's proxy |
+
+A download on the free plan needs about 110 MB of RAM and a little disk space
+for the file itself. The Render disk (`/data`) keeps finished files between
+deploys; without a disk the files disappear when the service restarts.
 
 ---
 

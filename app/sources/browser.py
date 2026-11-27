@@ -23,6 +23,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from .. import config
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/156.0.0.0 Safari/537.36"
@@ -68,6 +70,8 @@ def playwright_available() -> bool:
 
 def browser_available() -> bool:
     """True when both Playwright and a Chromium build are present."""
+    if not getattr(config, "BROWSER_ENABLED", True):
+        return False
     return playwright_available() and chromium_path() is not None
 
 

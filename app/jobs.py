@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import threading
 import time
 import uuid
@@ -20,6 +21,23 @@ from .ytdlp_client import (
 )
 
 TERMINAL_STATES = {"completed", "error", "cancelled"}
+
+
+def _disk_space_problem() -> str:
+    """Complain when the download disk is too full for a new file."""
+    needed_mb = int(config.MIN_FREE_DISK_MB)
+    if needed_mb <= 0:
+        return ""
+    try:
+        free_mb = shutil.disk_usage(str(config.DOWNLOAD_DIR)).free // (1024 * 1024)
+    except Exception:
+        return ""
+    if free_mb < needed_mb:
+        return (
+            f"The download disk has only {free_mb} MB free, "
+            f"at least {needed_mb} MB are needed."
+        )
+    return ""
 
 
 @dataclass
@@ -239,8 +257,22 @@ class JobManager:
         )
         with self._lock:
             self._jobs[job.id] = job
+            self._trim_jobs()
         self._persist(job)
         return job
+
+    def _trim_jobs(self) -> None:
+        """Drop the oldest finished jobs so the memory stays bounded."""
+        limit = max(10, int(config.MAX_HISTORY_JOBS))
+        if len(self._jobs) <= limit:
+            return
+        finished = [
+            job for job in self._jobs.values() if job.status in TERMINAL_STATES
+        ]
+        finished.sort(key=lambda job: job.created_at)
+        while len(self._jobs) > limit and finished:
+            oldest = finished.pop(0)
+            self._jobs.pop(oldest.id, None)
 
     def start(self, job: Job, selector: str, subtitles: bool = False) -> None:
         """Schedule the download of *job*."""
@@ -288,6 +320,10 @@ class JobManager:
                     job.status = "downloading"
                     job.stage = "Starting..."
                     job.touch()
+
+                space_problem = _disk_space_problem()
+                if space_problem:
+                    raise RuntimeError(space_problem)
 
                 path: Path = await asyncio.to_thread(
                     download_media,

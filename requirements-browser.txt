@@ -1,0 +1,10 @@
+# Browser automation. Used for links that only open when their JavaScript
+# challenge has been executed by a real browser.
+#
+# This package is 165 MB on its own and the Chromium build adds another
+# 400 MB, so it is kept out of the core requirements.  Install it when the
+# browser route is needed:
+#
+#   pip install -r requirements-browser.txt
+#   python -m playwright install chromium
+playwright>=1.45.0
