@@ -23,7 +23,7 @@ import yt_dlp
 from yt_dlp.utils import DownloadError
 
 from . import config
-from .sources import toonworld
+from .sources import multimovies, toonworld
 
 __all__ = [
     "CancelledError",
@@ -125,6 +125,8 @@ def base_opts(impersonate: Optional[str] = None) -> Dict[str, Any]:
         "overwrites": False,
     }
     if impersonate and config.IMPERSONATION_AVAILABLE:
+        # The Python API expects an ImpersonateTarget object; the command line
+        # converts the plain string for us.
         target = _impersonate_target(impersonate)
         if target is not None:
             opts["impersonate"] = target
@@ -357,13 +359,12 @@ def analyze(url: str) -> Dict[str, Any]:
     video) or an ``entries`` list (playlist / album / channel).
     """
     url = url.strip()
-    if toonworld.matches(url):
-        try:
-            return toonworld.probe(url)
-        except toonworld.ToonWorldError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise DownloadError(str(exc)) from exc
+    for source in (toonworld, multimovies):
+        if source.matches(url):
+            try:
+                return source.probe(url)
+            except Exception as exc:  # noqa: BLE001
+                raise DownloadError(str(exc)) from exc
 
     opts = base_opts()
     opts.update(
@@ -461,6 +462,17 @@ def download_media(
             on_log=on_log,
             should_cancel=should_cancel,
         )
+    if selector.startswith("multimovies:"):
+        return _download_multimovies(
+            url,
+            selector.split(":", 1)[1],
+            outtmpl=outtmpl,
+            mode=mode,
+            subtitles=subtitles,
+            on_progress=on_progress,
+            on_log=on_log,
+            should_cancel=should_cancel,
+        )
     return _download_direct(
         url,
         outtmpl=outtmpl,
@@ -473,27 +485,26 @@ def download_media(
     )
 
 
-def _download_toonworld(
-    url: str,
-    quality_id: str,
+def _download_source_list(
+    candidates: List[Dict[str, Any]],
     *,
     outtmpl: str,
-    mode: str = "video",
-    subtitles: bool = False,
-    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
-    on_log: Optional[Callable[[str, str], None]] = None,
-    should_cancel: Optional[Callable[[], bool]] = None,
+    mode: str,
+    subtitles: bool,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]],
+    on_log: Optional[Callable[[str, str], None]],
+    should_cancel: Optional[Callable[[], bool]],
+    label: str = "host",
 ) -> Path:
-    """Try every host for a toonworld4all.me quality until one works."""
-    sources = toonworld.resolve_sources(url, quality_id)
+    """Try each candidate source in turn until one delivers the file."""
     failures: List[str] = []
 
-    for source in sources:
+    for source in candidates:
         if should_cancel and should_cancel():
             raise CancelledError("Download cancelled by the user.")
-        host = source.get("host") or "host"
+        host = source.get("host") or label
         destination = source.get("url")
-        detail = source.get("detail") or source.get("error") or ""
+        detail = source.get("detail") or ""
         if not destination:
             failures.append(f"{host}: {detail or 'no destination'}")
             if on_log:
@@ -520,10 +531,12 @@ def _download_toonworld(
                     on_log=on_log,
                     should_cancel=should_cancel,
                     impersonate="chrome",
+                    referer=source.get("referer"),
                 )
-            problem = verify_media_file(path, source.get("expected_size"))
-            if problem:
-                raise DownloadError(problem)
+            if source.get("expected_size") is not None:
+                problem = verify_media_file(path, source.get("expected_size"))
+                if problem:
+                    raise DownloadError(problem)
             return path
         except CancelledError:
             raise
@@ -534,12 +547,85 @@ def _download_toonworld(
                     "the host page did not expose a direct file URL "
                     "(the archive id looks like a placeholder)"
                 )
+            lowered = destination.lower()
+            is_playlist = ".m3u8" in lowered or lowered.split("?")[0].endswith(".txt")
+            if is_playlist and not source.get("ffmpeg_tried"):
+                if on_log:
+                    on_log("info", f"Retrying {host} with the ffmpeg downloader")
+                try:
+                    return _download_direct(
+                        destination,
+                        outtmpl=outtmpl,
+                        selector="best",
+                        mode=mode,
+                        subtitles=subtitles,
+                        on_progress=on_progress,
+                        on_log=on_log,
+                        should_cancel=should_cancel,
+                        impersonate="chrome",
+                        use_ffmpeg=True,
+                        referer=source.get("referer"),
+                    )
+                except CancelledError:
+                    raise
+                except Exception as retry_exc:  # noqa: BLE001
+                    message = str(retry_exc).strip() or retry_exc.__class__.__name__
             failures.append(f"{host}: {message}")
             if on_log:
                 on_log("warning", f"{host} failed: {message}")
 
-    detail = " | ".join(failures) if failures else "no hosts were offered"
-    raise DownloadError(f"Every download host failed for this episode. {detail}")
+    detail = " | ".join(failures) if failures else "no sources were offered"
+    raise DownloadError(f"Every download source failed for this item. {detail}")
+
+
+def _download_multimovies(
+    url: str,
+    quality_id: str,
+    *,
+    outtmpl: str,
+    mode: str = "video",
+    subtitles: bool = False,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_log: Optional[Callable[[str, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Path:
+    """Download a MultiMovies episode, failing over between streaming servers."""
+    candidates = multimovies.resolve_sources(url, quality_id)
+    return _download_source_list(
+        candidates,
+        outtmpl=outtmpl,
+        mode=mode,
+        subtitles=subtitles,
+        on_progress=on_progress,
+        on_log=on_log,
+        should_cancel=should_cancel,
+        label="server",
+    )
+
+
+def _download_toonworld(
+    url: str,
+    quality_id: str,
+    *,
+    outtmpl: str,
+    mode: str = "video",
+    subtitles: bool = False,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_log: Optional[Callable[[str, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Path:
+    """Try every host for a toonworld4all.me quality until one works."""
+    sources = toonworld.resolve_sources(url, quality_id)
+    return _download_source_list(
+        sources,
+        outtmpl=outtmpl,
+        mode=mode,
+        subtitles=subtitles,
+        on_progress=on_progress,
+        on_log=on_log,
+        should_cancel=should_cancel,
+        label="host",
+    )
 
 
 def verify_media_file(path: Path, expected_size: Optional[int] = None) -> Optional[str]:
@@ -640,6 +726,8 @@ def _download_direct(
     on_log: Optional[Callable[[str, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     impersonate: Optional[str] = None,
+    use_ffmpeg: bool = False,
+    referer: Optional[str] = None,
 ) -> Path:
     """Download straight from *url* with yt-dlp."""
     finished: List[Path] = []
@@ -717,6 +805,19 @@ def _download_direct(
         # ``mp4/mkv`` lets ffmpeg fall back to MKV when MP4 cannot hold the
         # codecs, instead of failing the whole download.
         opts["merge_output_format"] = "mp4/mkv"
+
+    if referer:
+        # Streaming hosts block requests that do not come from their player.
+        headers = dict(opts.get("http_headers") or {})
+        headers["Referer"] = referer
+        opts["http_headers"] = headers
+
+    # A playlist served as ".txt" is not recognised as HLS by the native
+    # downloader, so ffmpeg reads it directly.
+    if use_ffmpeg or url.lower().split("?")[0].endswith(".txt"):
+        opts["downloader"] = "ffmpeg"
+        opts["hls_use_mpegts"] = True
+        opts["continuedl"] = True
 
     if subtitles:
         opts.update(

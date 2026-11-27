@@ -1,5 +1,3 @@
-<img width="1500" height="980" alt="ui_3_episode" src="https://github.com/user-attachments/assets/25e10ab5-c81e-49ec-8d8e-69f0cc7aa772" />
-<img width="1500" height="980" alt="ui_2_playlist" src="https://github.com/user-attachments/assets/9e87461c-6164-4711-b57b-1e7d2ad14a20" />
 # Universal Video Downloader
 
 A self-hosted web app that downloads **video and audio from ~1,800 different sites** —
@@ -19,7 +17,7 @@ batch queues, cancellation, and a clean API you can script against.
 | | |
 |---|---|
 | **1,700+ sites** | Every plugin shipped with yt-dlp, listed live in the UI |
-| **Native site support** | `toonworld4all.me` is understood natively: season pages, playlists, quality tiers, per-host failover |
+| **Native site support** | `toonworld4all.me` and `multimovies.wtf` are understood natively: season pages, playlists, quality tiers, per-host/per-server failover |
 | **Cloudflare-ready** | Browser impersonation (`curl_cffi`) clears bot challenges without a headless browser |
 | **Quality picker** | Best / 4K / 1080p / 720p / … / audio-only, with size estimates |
 | **Live progress** | Server-sent events stream bytes, speed and ETA as you download |
@@ -205,6 +203,8 @@ app/
     mega.py             MEGA API client and AES-128-CTR decryption
     toonworld.py        Native toonworld4all.me extractor
     toonworld_hosts.py  Filepress, GDFlix, HubCloud, MEGA and AppDrive resolvers
+    multimovies.py      Native multimovies.wtf extractor
+    embed_resolver.py   Resolves the streaming providers used by multimovies
 static/
   index.html        Single-page UI
   styles.css        Dark theme
@@ -214,6 +214,10 @@ tests/
   test_toonworld.py        Episode, season and token parsing
   test_toonworld_hosts.py  Host resolvers
   test_toonworld_resolution.py  Resolution pipeline and download checks
+  test_multimovies.py      multimovies.wtf extractor
+  test_storage.py          MongoDB / in-memory job history
+  test_telegram_bot.py     Telegram command handling
+  test_telegram_flow.py    Telegram keyboard and upload flow
 ```
 
 ---
@@ -369,6 +373,20 @@ links the shortener hands out. Verification widgets are never clicked; the
 page is only given the chance to verify itself, and when it does not, the job
 reports that instead of pretending the file was downloaded.
 
+**The tokens rotate**
+
+The archive mints a **new token on every page load** — three consecutive
+fetches of the same episode return three different sets of tokens. A token
+captured during the analysis is therefore worthless by the time the download
+starts.
+
+The app handles this by never downloading from the analysis snapshot. When a
+job starts, the episode page is **fetched again** and the tokens from *that*
+response are decoded, so the download always races against a live token.
+`tests/test_toonworld.py` locks this behaviour in place: the test serves a
+page with one token, analyses it, then serves the same page with a different
+token and asserts that the download uses the new one.
+
 **Cloudflare**
 
 Both `toonworld4all.me` and `archive.toonworld4all.me` sit behind Cloudflare's
@@ -412,6 +430,106 @@ not complete on its own | ...
 
 No file is written in that case. `/api/health` reports the Chromium build the
 browser route would use (`browser`, `browser_path`).
+
+---
+
+## Native support: multimovies.wtf
+
+`multimovies.wtf` is the public landing page; the catalogue itself lives on
+`m1.multimovies.courses` (and `multinime.site` for anime). The app treats
+all three as one source.
+
+**What the extractor does**
+
+1. A **series page** (`/series/<slug>-<id>`) becomes a playlist of episode
+   URLs, in season/episode order.
+2. An **episode page** (`/series/<slug>-<id>/season/3/episode/14`) and a
+   **movie page** (`/movie/<slug>`) are parsed from the `watchConfig` object
+   that the app server-renders. It lists every streaming provider offered for
+   that title:
+
+   | Provider | Embed URL |
+   |---|---|
+   | Cineverse | `rozgarlelo.modiplay.xyz/embed/tmdb/tv?id=652&s=3&e=14` |
+   | GD mirror | `streams.iqsmartgames.com/embed/tv/652/3/14?key=…` |
+   | Nexus | `www.moviesnexus.fun/tv/652/3/14` |
+   | Vidrift | `embed.vidrift.net/embed/tv/652/3/14` |
+   | VIDOUT | `vidout.pages.dev/tv/652/s3/e14` |
+   | Vidbolt | `vidbolt.xyz/tv/652/3/14` |
+
+3. Each provider is resolved to its media URL and the HLS master playlist is
+   read to list the real qualities. Providers that cannot be resolved stay
+   visible in the analysis with the reason, instead of disappearing.
+
+**Resolving the providers**
+
+Every provider hides its media URL behind its own JavaScript, so each one has
+a dedicated resolver:
+
+| Provider | How it is resolved |
+|---|---|
+| Cineverse | The embed only carries a player iframe; the proxied player document exposes the media URL as `var src="…"` |
+| Vidrift | The page carries an `embedMeta.playbackToken`; `/api/source/…` exchanges it for a `proxyUrl` |
+| VIDOUT | The episode maps to a `master.txt` in the GitHub-hosted manifest repository |
+| Vidbolt | The page carries `window.__VB__`; `/api/resolve` returns the stream URL (the call needs a `Referer` header, otherwise it answers `403`) |
+| Unknown | A headless Chromium fallback reads the player for providers without a resolver |
+
+Two providers are deliberately left unresolved and are reported as such
+instead of hanging the download:
+
+| Provider | Why |
+|---|---|
+| GD mirror | The player hands out its source details encrypted and then runs a proof-of-work challenge behind a session path that changes on every load. The browser fallback reaches the player but cannot finish the challenge. |
+| Nexus | The host answers with a Cloudflare "temporarily rate limited" page. |
+
+**The `Referer` header**
+
+The streaming hosts behind Cineverse and VIDOUT answer with a Cloudflare
+block page ("Sorry, you have been blocked") unless the request carries the
+`Referer` of the player that uses the playlist. The app therefore sends the
+provider's embed URL as the `Referer` for both the playlist lookup and the
+download itself — including every HLS segment request.
+
+**Quality selection**
+
+Qualities are merged across providers. If two providers offer 720p, both are
+tried in order and the first one that delivers wins. Heights are rounded to
+the standard tier, so a 1280x718 stream is listed as 720p instead of
+getting a tier of its own:
+
+```
+720p  →  Cineverse, VIDOUT, Vidbolt
+480p  →  VIDOUT
+360p  →  Vidbolt
+```
+
+HLS streams are downloaded with yt-dlp's native downloader; a stream that the
+native downloader cannot handle is retried with the ffmpeg downloader and
+`--hls-use-mpegts` before the source is written off. Playlists that are
+served as a `.txt` file are handed to ffmpeg straight away, because the native
+downloader only recognises `.m3u8`. `pycryptodomex` is installed for the
+AES-128 protected streams these hosts use.
+
+Variant playlists that address their variants with a relative path are
+resolved against the playlist URL, so the downloader never hands a bare
+`/v/…` path to yt-dlp.
+
+**Verified end to end**
+
+`What's New, Scooby-Doo? S03E14 — E-Scream` was analysed and downloaded
+through the app three times, once through a different provider each time:
+
+| Quality | Provider | Result |
+|---|---|---|
+| 480p | Vidbolt | H.265 854×480, 21 min, 87.5 MB |
+| 480p | VIDOUT | H.264 960×538, 19.6 min, 82.7 MB |
+| 360p | Vidbolt | H.264 + AAC 640×360, 20.3 min, 79.4 MB |
+
+All three were served back over `/api/jobs/<id>/file` as `video/mp4`.
+
+The analysis resolves three of the six providers at once (Cineverse, VIDOUT
+and Vidbolt, with Vidrift appearing intermittently) and reports the others
+with the reason they were skipped.
 
 ---
 

@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover
     HAS_CURL_CFFI = False
 
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -42,8 +43,12 @@ def fetch(
     timeout: int = 60,
     impersonate: Optional[str] = "chrome",
     headers: Optional[Dict[str, str]] = None,
+    data: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, str, Dict[str, str]]:
-    """GET *url* and return ``(status, body, headers)``."""
+    """GET *url* and return ``(status, body, headers)``.
+
+    When *data* is given the request is sent as a form POST instead.
+    """
     request_headers = {
         "User-Agent": DEFAULT_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -58,10 +63,19 @@ def fetch(
         kwargs = {"headers": request_headers, "timeout": timeout}
         if impersonate:
             kwargs["impersonate"] = impersonate
-        response = _curl_requests.get(url, **kwargs)
+        if data is not None:
+            response = _curl_requests.post(url, data=data, **kwargs)
+        else:
+            response = _curl_requests.get(url, **kwargs)
         return response.status_code, response.text, dict(response.headers)
 
-    request = urllib.request.Request(url, headers=request_headers)
+    payload = None
+    if data is not None:
+        payload = urllib.parse.urlencode(data).encode()
+        request_headers.setdefault(
+            "Content-Type", "application/x-www-form-urlencoded"
+        )
+    request = urllib.request.Request(url, data=payload, headers=request_headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", "replace")

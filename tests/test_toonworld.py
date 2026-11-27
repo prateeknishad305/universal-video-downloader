@@ -6,6 +6,7 @@ whole extraction pipeline is exercised without touching the network.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -105,6 +106,53 @@ def test_resolve_sources_returns_one_entry_per_host(fake_fetch):
     )
     assert len(sources) == 4
     assert {s["host"] for s in sources} == {"HubCloud", "Filepress", "GDFlix", "MEGA"}
+
+
+def test_resolve_sources_refetches_the_page_for_a_fresh_token(monkeypatch):
+    """The site mints a new redirect token on every page load.
+
+    A token captured during the analysis is worthless minutes later, so the
+    download path must resolve against a freshly fetched episode page.
+    """
+    page = read_fixture("episode_page.html")
+    stale = re.sub(r"/redirect/[a-f0-9]+", "/redirect/" + "a" * 64, page)
+    fresh = re.sub(r"/redirect/[a-f0-9]+", "/redirect/" + "b" * 64, page)
+    served = {"n": 0}
+
+    def _fetch(url, **kwargs):
+        if "/episode/" in url:
+            served["n"] += 1
+            return 200, stale if served["n"] == 1 else fresh, {}
+        if "/redirect/" in url:
+            return 200, read_fixture("redirect_page.html"), {}
+        return 404, "", {}
+
+    monkeypatch.setattr(http, "fetch", _fetch)
+    monkeypatch.setattr(
+        toonworld,
+        "probe_destination",
+        lambda url: {"state": "ok", "detail": ""},
+    )
+    monkeypatch.setattr(
+        toonworld,
+        "resolve_destination",
+        lambda token: (f"https://files.example.com/{token}", None),
+    )
+
+    # 1. the analysis, which captures a token
+    toonworld.probe_episode("https://archive.toonworld4all.me/episode/naruto-shippuden-1x373")
+    assert served["n"] == 1
+
+    # 2. the download, which must not reuse the captured token
+    sources = toonworld.resolve_sources(
+        "https://archive.toonworld4all.me/episode/naruto-shippuden-1x373",
+        "480p-h264-8bit",
+    )
+    assert served["n"] == 2, "the episode page must be fetched again for the download"
+    tokens = {source["token"] for source in sources}
+    assert tokens, "no sources were resolved"
+    assert all(token == "b" * 64 for token in tokens), tokens
+    assert not any(token == "a" * 64 for token in tokens)
 
 
 def test_validate_host_id_flags_the_wrong_id_format():
