@@ -20,13 +20,10 @@ Supported hosts: HubCloud, Filepress, GDFlix and MEGA.
 
 from __future__ import annotations
 
-import json
 import re
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import http
-from . import toonworld_hosts
 
 SITE = "toonworld4all.me"
 ARCHIVE = "archive.toonworld4all.me"
@@ -34,21 +31,58 @@ ARCHIVE = "archive.toonworld4all.me"
 _EPISODE_RE = re.compile(
     rf"https?://{re.escape(ARCHIVE)}/episode/(?P<slug>[a-z0-9\-]+)", re.I
 )
+_MOVIE_RE = re.compile(
+    rf"https?://{re.escape(ARCHIVE)}/movie/(?P<slug>[a-z0-9\-]+)", re.I
+)
+# A detail page on the WordPress front end points at the archive.
+_DETAIL_RE = re.compile(
+    rf"https?://{re.escape(ARCHIVE)}/(?:episode|movie)/[a-z0-9\-]+", re.I
+)
+# A link from the front end to another detail page (show or movie).
+_SHOW_LINK_RE = re.compile(
+    rf"https?://(?:www\.)?{re.escape(SITE)}/[a-z0-9\-_]+/?", re.I
+)
+
+# WordPress plumbing and the site's own index pages are not titles.
+_NOT_A_TITLE = (
+    "/comments",
+    "/feed",
+    "/xmlrpc",
+    "/wp-admin",
+    "/wp-content",
+    "/wp-json",
+    "/wp-includes",
+    "/author",
+    "/page",
+    "/tag",
+    "/category",
+    "/search",
+    "/hindi-dubbed",
+    "/english-dubbed",
+    "/multi-audio",
+    "/first-on-ne",
+    "/exclusive-shows",
+    "/dmca",
+    "/privacy",
+    "/terms",
+    "/contact",
+    "/about",
+)
 _PROPS_RE = re.compile(r"window\.__PROPS__\s*=\s*(\{.*?\});?\s*</script>", re.S)
 _CODE_RE = re.compile(r'<code[^>]*>(.*?)</code>', re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
+# The front end lists its titles in two shapes: a heading with a link (the
+# category, tag and home pages) and a list item (the "all movies" pages).
+_CARD_HEADING_RE = re.compile(
+    r'<h[234][^>]*>\s*<a[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>[^<]{2,160})', re.I
+)
+_CARD_LIST_RE = re.compile(
+    r'<li[^>]*>.{0,400}?<a[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>[^<]{2,160})', re.S | re.I
+)
 _HEADING_RE = re.compile(
-    r'mks_accordion_heading[^>]*><strong>(?P<title>[^<]+)</strong>'
-    r'(?P<body>(?:(?!mks_accordion_heading).)*)',
+    r'mks_accordion_heading[^>]*><strong>(?P<title>[^<]+)</strong>.*?'
+    r'href="(?P<url>https?://[^"]+/redirect/[a-f0-9]+)"',
     re.S,
-)
-_EPISODE_HREF_RE = re.compile(
-    r'href="(?P<url>(?:https?://[^"]+)?/episode/(?P<slug>[a-z0-9\-]+))"',
-    re.I,
-)
-_REDIRECT_HREF_RE = re.compile(
-    r'href="(?P<url>(?:https?://[^"]+)?/redirect/(?P<token>[a-f0-9]+))"',
-    re.I,
 )
 
 
@@ -66,6 +100,7 @@ def _unwrap_props(html_text: str) -> Dict[str, Any]:
     if not match:
         raise ToonWorldError("The page did not contain any episode data.")
     raw = match.group(1).replace('\\"', '"').replace("\\'", "'")
+    import json
 
     try:
         props = json.loads(raw)
@@ -99,35 +134,38 @@ def _host_slug(host: str) -> str:
 
 def probe_season(url: str) -> Dict[str, Any]:
     """Turn a season page into a playlist of episodes."""
-    status, body, _ = http.fetch(url)
-    if status >= 400:
-        raise ToonWorldError(f"The season page returned HTTP {status}.")
+    return probe_show(url)
+
+
+# --------------------------------------------------------------------------- #
+# detail pages (shows and movies)
+# --------------------------------------------------------------------------- #
+
+
+def probe_show(url: str, body: Optional[str] = None) -> Dict[str, Any]:
+    """Turn a show page into a playlist of episode URLs."""
+    if body is None:
+        status, body, _ = http.fetch(url)
+        if status >= 400:
+            raise ToonWorldError(f"The page returned HTTP {status}.")
 
     entries: List[Dict[str, Any]] = []
     seen = set()
     for match in _HEADING_RE.finditer(body):
-        title = re.sub(r"\s+", " ", match.group("title")).strip()
-        block = match.group("body")
-        episode = _EPISODE_HREF_RE.search(block)
-        if episode:
-            key = episode.group("slug")
-            link = episode.group("url")
-        else:
-            redirect = _REDIRECT_HREF_RE.search(block)
-            if not redirect:
-                continue
-            key = redirect.group("token")
-            link = redirect.group("url")
+        episode_url = match.group("url")
+        slug = _EPISODE_RE.search(episode_url)
+        if not slug:
+            continue
+        key = slug.group("slug")
         if key in seen:
             continue
         seen.add(key)
-        if not link.startswith("http"):
-            link = f"https://{ARCHIVE}{link}"
+        title = re.sub(r"\s+", " ", match.group("title")).strip()
         entries.append(
             {
                 "id": key,
                 "title": title,
-                "url": link,
+                "url": f"https://{ARCHIVE}/episode/{key}",
                 "duration": None,
                 "thumbnail": None,
                 "uploader": None,
@@ -153,16 +191,151 @@ def probe_season(url: str) -> Dict[str, Any]:
             )
 
     if not entries:
-        raise ToonWorldError("No episodes were found on that season page.")
+        raise ToonWorldError("No episodes were found on that page.")
 
     title = re.search(r"<title>(.*?)</title>", body, re.S)
-    season_title = title.group(1).split("|")[0].strip() if title else "Season"
-    season_title = re.sub(r"^Download\s+", "", season_title, flags=re.I)
+    show_title = title.group(1).split("|")[0].strip() if title else "Show"
+    show_title = re.sub(r"^Download\s+", "", show_title, flags=re.I)
 
     return {
         "kind": "playlist",
         "id": re.sub(r"[^a-z0-9]+", "-", url.lower())[-60:],
-        "title": season_title,
+        "title": show_title,
+        "uploader": "ToonWorld4All",
+        "thumbnail": None,
+        "webpage_url": url,
+        "playlist_count": len(entries),
+        "entries": entries,
+        "extractor": "ToonWorld4All",
+    }
+
+
+def archive_item_url(url: str, body: Optional[str] = None) -> Optional[str]:
+    """Return the archive URL that a front-end detail page points at.
+
+    A show page points at one archive page per episode and a movie page at
+    a single ``/movie/`` page.
+    """
+    if body is None:
+        status, body, _ = http.fetch(url)
+        if status >= 400:
+            return None
+    movie = _MOVIE_RE.search(body)
+    if movie:
+        return f"https://{ARCHIVE}/movie/{movie.group('slug')}"
+    episode = _EPISODE_RE.search(body)
+    if episode:
+        return f"https://{ARCHIVE}/episode/{episode.group('slug')}"
+    return None
+
+
+def _is_title_link(link: str) -> bool:
+    """True when a front-end link points at a show or a movie."""
+    lowered = link.lower()
+    if lowered.endswith(SITE):
+        return False
+    path = re.sub(r"^https?://[^/]+", "", lowered)
+    if any(path.startswith(bad) for bad in _NOT_A_TITLE):
+        return False
+    # The index pages ("all-movies-list_25", "tv-shows-list") are not titles.
+    if re.search(r"(-list|_list)(_\d+)?$", path):
+        return False
+    return bool(path.strip("/"))
+
+
+def _listing_cards(body: str) -> List[Tuple[str, str]]:
+    """Return the (url, title) pairs a listing page shows.
+
+    The navigation menu is on every page and its links look just like the
+    title links, so only the content region is scanned.
+    """
+    import html as html_module
+
+    marker = re.search(r'id="content"', body, re.I)
+    if marker:
+        body = body[marker.start():]
+
+    cards: List[Tuple[str, str]] = []
+    seen = set()
+    for pattern in (_CARD_HEADING_RE, _CARD_LIST_RE):
+        for match in pattern.finditer(body):
+            link = match.group("url").strip()
+            title = html_module.unescape(re.sub(r"\s+", " ", match.group("title"))).strip()
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            cards.append((link, title))
+    return cards
+
+
+def probe_listing(url: str, body: Optional[str] = None, pages: int = 3) -> Dict[str, Any]:
+    """Turn a category, tag, list or home page into a playlist of titles.
+
+    Those pages list the shows and movies of the front end; each entry
+    points at the detail page, which is then analysed for the episodes
+    or the movie file.
+    """
+    if body is None:
+        status, body, _ = http.fetch(url)
+        if status >= 400:
+            raise ToonWorldError(f"The listing returned HTTP {status}.")
+
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+
+    def add(link: str, title: str) -> None:
+        link = link.rstrip("/")
+        key = link.lower()
+        if key in seen or not _is_title_link(link):
+            return
+        seen.add(key)
+        slug = link.rsplit("/", 1)[-1]
+        entries.append(
+            {
+                "id": slug,
+                "title": title or slug.replace("-", " ").title(),
+                "url": f"{link}/",
+                "duration": None,
+                "thumbnail": None,
+                "uploader": "ToonWorld4All",
+            }
+        )
+
+    for link, title in _listing_cards(body):
+        add(link, title)
+
+    if not entries:
+        # Fall back to a plain scan of the links on the page.
+        marker = re.search(r'id="content"', body, re.I)
+        region = body[marker.start():] if marker else body
+        for match in _SHOW_LINK_RE.finditer(region):
+            add(match.group(0), "")
+
+    # Follow the pagination of a category or tag listing.
+    page_urls = re.findall(
+        rf'href="(https?://(?:www\.)?{re.escape(SITE)}/[^"]*?/page/\d+/)"', body, re.I
+    )
+    for next_url in list(dict.fromkeys(page_urls))[: max(0, pages - 1)]:
+        try:
+            status, next_body, _ = http.fetch(next_url)
+        except Exception:  # noqa: BLE001
+            continue
+        if status >= 400:
+            continue
+        for link, title in _listing_cards(next_body):
+            add(link, title)
+
+    if not entries:
+        raise ToonWorldError("That page does not list any titles.")
+
+    title = re.search(r"<title>(.*?)</title>", body, re.S)
+    listing_title = title.group(1).split("|")[0].strip() if title else "ToonWorld4All"
+    listing_title = re.sub(r"^Download\s+", "", listing_title, flags=re.I)
+
+    return {
+        "kind": "playlist",
+        "id": re.sub(r"[^a-z0-9]+", "-", url.lower())[-60:],
+        "title": listing_title,
         "uploader": "ToonWorld4All",
         "thumbnail": None,
         "webpage_url": url,
@@ -178,7 +351,7 @@ def probe_season(url: str) -> Dict[str, Any]:
 
 
 def probe_episode(url: str) -> Dict[str, Any]:
-    """Turn an episode page into a video with one format per quality+host."""
+    """Turn an episode or movie page into a video with one format per quality+host."""
     status, body, _ = http.fetch(url)
     if status >= 400:
         raise ToonWorldError(f"The episode page returned HTTP {status}.")
@@ -256,7 +429,12 @@ def probe_episode(url: str) -> Dict[str, Any]:
 
     title = metadata.get("name") or "Episode"
     show = metadata.get("show") or ""
-    full_title = f"{show} - S{metadata.get('season')}E{metadata.get('episode')} - {title}" if show else title
+    if show and metadata.get("season") and metadata.get("episode"):
+        full_title = f"{show} - S{metadata['season']}E{metadata['episode']} - {title}"
+    elif show:
+        full_title = f"{show} - {title}"
+    else:
+        full_title = title
 
     return {
         "kind": "video",
@@ -282,12 +460,34 @@ def probe_episode(url: str) -> Dict[str, Any]:
 
 
 def probe(url: str) -> Dict[str, Any]:
-    """Probe any toonworld4all.me URL (season page or episode page)."""
-    if re.search(rf"{re.escape(ARCHIVE)}/episode/", url, re.I):
+    """Probe any toonworld4all.me URL.
+
+    * an archive episode or movie page -> a video with its quality tiers
+    * a show page                    -> a playlist of episodes
+    * a movie page                   -> the movie, as a video
+    * a category, tag, list or home page -> a playlist of titles
+    """
+    if re.search(rf"{re.escape(ARCHIVE)}/(episode|movie)/", url, re.I):
         analysis = probe_episode(url)
         analysis.pop("quality_map", None)
         return analysis
-    return probe_season(url)
+
+    status, body, _ = http.fetch(url)
+    if status >= 400:
+        raise ToonWorldError(f"The page returned HTTP {status}.")
+
+    episodes = _EPISODE_RE.findall(body)
+    movies = _MOVIE_RE.findall(body)
+    if episodes:
+        # A show page: one archive link per episode.
+        return probe_show(url, body)
+    if movies:
+        # A movie page: the file lives on the archive.
+        analysis = probe_episode(f"https://{ARCHIVE}/movie/{movies[0]}")
+        # Keep the page the user pasted.
+        analysis["webpage_url"] = url
+        return analysis
+    return probe_listing(url, body)
 
 
 # --------------------------------------------------------------------------- #
@@ -322,199 +522,6 @@ def resolve_destination(token: str, timeout: int = 60) -> Tuple[Optional[str], O
     return None, "The redirect service did not reveal a destination URL."
 
 
-# --------------------------------------------------------------------------- #
-# interstitial page
-# --------------------------------------------------------------------------- #
-
-_HOST_PATTERNS = (
-    ("hubcloud", re.compile(r"hubcloud\.[a-z.]+/drive/([A-Za-z0-9]{6,32})", re.I)),
-    ("filepress", re.compile(r"filepress\.[a-z.]+/file/([A-Za-z0-9]{16,32})", re.I)),
-    ("gdflix", re.compile(r"gdflix\.[a-z.]+/file/([A-Za-z0-9]{6,32})", re.I)),
-    ("mega", re.compile(r"mega\.nz/file/([A-Za-z0-9_-]{8,64})#([A-Za-z0-9_-]{20,64})", re.I)),
-    ("appdrive", re.compile(r"appdrive\.[a-z.]+/file/([A-Za-z0-9]{6,32})", re.I)),
-)
-
-
-def host_id_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
-    """Map a host URL onto ``(host, file id)``."""
-    for host, pattern in _HOST_PATTERNS:
-        match = pattern.search(url or "")
-        if match:
-            if host == "mega":
-                return host, f"{match.group(1)}#{match.group(2)}"
-            return host, match.group(1)
-    return None, None
-
-
-def resolve_interstitial(token: str, timeout: int = 60) -> Dict[str, Any]:
-    """Read the interstitial page of a redirect token.
-
-    The page carries the ad shortener that guards the real links as well as
-    the host the token belongs to.  Both are returned so the caller can decide
-    how to continue.
-    """
-    if not token:
-        return {"error": "The link did not contain a redirect token."}
-    url = f"https://{ARCHIVE}/redirect/{token}"
-    try:
-        status, body, _ = http.fetch(url, timeout=timeout)
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"Could not reach the redirect service: {exc}"}
-
-    if status >= 400:
-        return {"error": f"The redirect service returned HTTP {status}."}
-
-    props: Dict[str, Any] = {}
-    match = _PROPS_RE.search(body)
-    if match:
-        raw = match.group(1).replace('\\"', '"').replace("\\'", "'")
-        try:
-            props = json.loads(raw)
-        except json.JSONDecodeError:
-            props = {}
-
-    link = props.get("link") or {}
-    host = link.get("domain") or None
-    file_id = link.get("hidden") or None
-    shortener = props.get("destination") or None
-
-    printed = None
-    for code_match in _CODE_RE.finditer(body):
-        candidate = _TAG_RE.sub("", code_match.group(1)).strip()
-        if candidate.startswith("http"):
-            printed = candidate
-            break
-
-    return {
-        "destination": printed or shortener,
-        "shortener": shortener,
-        "host": host,
-        "file_id": file_id,
-        "props": props,
-        "error": None,
-    }
-
-
-def resolve_via_browser(token: str, timeout: int = 120) -> Dict[str, Any]:
-    """Open the interstitial in a real browser and follow it to the links.
-
-    The archive sends the visitor through an ad shortener.  A browser runs the
-    shortener's own JavaScript, which is the only way to learn where the real
-    files live.  Nothing is clicked inside a verification widget: the page is
-    given the chance to verify itself.
-    """
-    from . import browser as browser_module
-
-    if not token:
-        return {"error": "The link did not contain a redirect token."}
-    if not browser_module.browser_available():
-        return {"error": "No browser is available to follow the download page."}
-
-    session = browser_module.BrowserSession(timeout_ms=timeout * 1000)
-    try:
-        session.start()
-    except browser_module.BrowserUnavailable as exc:
-        return {"error": str(exc)}
-
-    try:
-        outcome = _follow_token_in_session(session, token, timeout)
-        return outcome
-    finally:
-        session.close()
-
-
-def _follow_token_in_session(session, token: str, timeout: int) -> Dict[str, Any]:
-    """Follow one interstitial inside an open browser session."""
-    interstitial = f"https://{ARCHIVE}/redirect/{token}"
-    session.isolated_context(domain=ARCHIVE)
-    page = session.page
-    try:
-        page.goto(interstitial, wait_until="domcontentloaded", timeout=timeout * 1000)
-        page.wait_for_timeout(1500)
-        try:
-            props = page.evaluate("() => window.__PROPS__ || null")
-        except Exception:
-            props = None
-        destination = (props or {}).get("destination") if isinstance(props, dict) else None
-        if not destination:
-            destination = interstitial
-
-        page.goto(destination, wait_until="domcontentloaded", timeout=timeout * 1000)
-        deadline = time.monotonic() + timeout
-        links: List[Dict[str, Any]] = []
-        while time.monotonic() < deadline:
-            links = _page_host_links(page)
-            if links:
-                break
-            if not _same_host(page.url, destination):
-                host, file_id = host_id_from_url(page.url)
-                if host and file_id:
-                    links = [{"host": host, "file_id": file_id, "url": page.url}]
-                    break
-            page.wait_for_timeout(2000)
-        if links:
-            return {"links": links, "error": None, "final_url": page.url}
-        return {
-            "links": [],
-            "error": _shortener_problem(page),
-            "final_url": page.url,
-        }
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"The browser could not follow the download page: {exc}"}
-
-
-def _shortener_problem(page) -> str:
-    """Describe why the ad shortener did not hand out a file link."""
-    try:
-        text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
-    except Exception:
-        text = ""
-    try:
-        frames = page.evaluate(
-            "() => Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(Boolean)"
-        )
-    except Exception:
-        frames = []
-    lowered = (text or "").lower()
-    if any("challenges.cloudflare.com" in str(frame) for frame in frames or []) or (
-        "verify" in lowered or "verification" in lowered
-    ):
-        return (
-            "the ad shortener asks for a Cloudflare verification that did not "
-            "complete on its own"
-        )
-    if "just a moment" in lowered or "checking your browser" in lowered:
-        return "the ad shortener is still checking the browser"
-    return "the ad shortener did not offer a file link"
-
-
-def _page_host_links(page) -> List[Dict[str, Any]]:
-    """Collect the host links a page offers."""
-    try:
-        found = page.evaluate(
-            "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)"
-        )
-    except Exception:
-        return []
-    links: List[Dict[str, Any]] = []
-    for link in found or []:
-        if not isinstance(link, str) or not link.startswith("http"):
-            continue
-        host, file_id = host_id_from_url(link)
-        if host and file_id:
-            links.append({"host": host, "file_id": file_id, "url": link})
-    return links
-
-
-def _same_host(first: str, second: str) -> bool:
-    def netloc(url: str) -> str:
-        match = re.match(r"https?://([^/]+)", url or "", re.I)
-        return match.group(1).lower() if match else ""
-
-    return netloc(first) == netloc(second)
-
-
-
 _HEX24_RE = re.compile(r"^[0-9a-f]{24}$", re.I)
 
 
@@ -527,26 +534,18 @@ def validate_host_id(host: str, file_id: str) -> Optional[str]:
     """
     if not file_id:
         return "the link carries no file id"
-    key = toonworld_hosts.normalize_host(host)
-    if key == "filepress" and not _HEX24_RE.match(file_id):
+    if host.lower() == "filepress" and not _HEX24_RE.match(file_id):
         return (
             f"invalid FilePress id '{file_id[:28]}' - FilePress only accepts a "
             "24 character hexadecimal object id"
         )
-    if key == "appdrive" and len(file_id) < 6:
+    if host.lower() == "appdrive" and len(file_id) < 6:
         return f"invalid AppDrive id '{file_id[:28]}' - AppDrive ids are at least 6 characters"
-    if key == "mega":
-        handle = file_id.split("#", 1)[0].strip()
-        if "#" not in file_id:
-            return (
-                f"incomplete MEGA link '{handle[:28]}' - the archive stored the file "
-                "handle without its decryption key"
-            )
-        if len(handle) < 20 or len(handle) > 64:
-            return (
-                f"invalid MEGA handle '{handle[:28]}' ({len(handle)} chars) - "
-                "MEGA file handles are 22 characters"
-            )
+    if host.lower() == "mega" and len(file_id) != 22:
+        return (
+            f"invalid MEGA handle '{file_id[:28]}' ({len(file_id)} chars) - "
+            "MEGA file handles are 22 characters"
+        )
     return None
 
 
@@ -600,20 +599,40 @@ def resolve_appdrive(file_id: str, timeout: int = 45) -> Tuple[Optional[str], Op
     AppDrive answers with a small HTML page that performs a JavaScript
     redirect carrying a signed token; the chain is followed here.
     """
-    result = toonworld_hosts.resolve_appdrive(file_id, timeout=timeout)
-    if result.ready:
-        return result.url, None
-    return None, result.detail or "AppDrive did not return a file link"
+    if not file_id:
+        return None, "the link carries no AppDrive file id"
+    url = f"https://appdrive.life/api/download/{file_id}"
+    referer = f"https://appdrive.life/file/{file_id}"
+    for _ in range(5):
+        try:
+            status, body, headers = http.fetch(url, referer=referer, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            return None, f"could not reach AppDrive: {exc}"
+        if status >= 400:
+            return None, f"AppDrive returned HTTP {status}"
+        match = re.search(r"window\.location\.replace\('([^']+)'\)", body)
+        if match:
+            url = match.group(1)
+            continue
+        direct = re.search(
+            r'"(https?://[^"]+\.(?:mp4|mkv|webm|avi|m3u8|zip)[^"]*)"', body, re.I
+        ) or re.search(
+            r'(?:finalUrl|final_url|downloadUrl|download_url)\s*[:=]\s*["\'](https?://[^"\']+)',
+            body,
+        )
+        if direct:
+            return direct.group(1), None
+        return None, "AppDrive returned an advertisement page instead of a file link"
+    return None, "AppDrive redirect chain did not terminate"
 
 
 def resolve_sources(url: str, quality_id: str) -> List[Dict[str, Any]]:
-    """Return the candidate file URLs for one quality, best host first.
-
-    Every source is resolved through its host resolver.  The archive hands out
-    a shortener protected link per host; when the ids it exposes turn out to
-    be placeholders, a browser session is used to follow the shortener and to
-    pick up the real links.
-    """
+    """Return the candidate file URLs for one quality, best host first."""
+    if not re.search(rf"{re.escape(ARCHIVE)}/(episode|movie)/", url, re.I):
+        # A front-end page (a movie, for example) - find the archive item.
+        archive_url = archive_item_url(url)
+        if archive_url:
+            url = archive_url
     analysis = probe_episode(url)
     quality = None
     for candidate in analysis.get("qualities", []):
@@ -623,205 +642,33 @@ def resolve_sources(url: str, quality_id: str) -> List[Dict[str, Any]]:
     if quality is None:
         quality = (analysis.get("qualities") or [{}])[0]
 
-    expected_size = quality.get("size")
-    if not isinstance(expected_size, int):
-        expected_size = None
-
     resolved: List[Dict[str, Any]] = []
-    browser_links: Optional[Dict[str, List[Dict[str, Any]]]] = None
-
     for source in quality.get("sources", []):
         token = source.get("token") or ""
         host = source.get("host") or ""
-        detail = ""
-        destination: Optional[str] = None
-        state = "unknown"
-        kind = "http"
-        extra: Dict[str, Any] = {}
-        host_known = bool(host)
-
         if source.get("direct"):
-            destination = source["direct"]
-            state = "ready"
-            detail = "direct link from the archive"
-        elif token:
-            interstitial = resolve_interstitial(token)
-            if interstitial.get("error"):
-                detail = interstitial["error"]
-            else:
-                file_id = interstitial.get("file_id")
-                host_name = host or interstitial.get("host") or ""
-                domain = interstitial.get("host") or None
-                if host_name:
-                    host_known = True
-                if file_id:
-                    problem = validate_host_id(host_name, file_id)
-                    if problem:
-                        state = "missing"
-                        detail = problem
-                    else:
-                        result = toonworld_hosts.resolve(
-                            host_name, file_id, referer=url, domain=domain
-                        )
-                        destination = result.url
-                        state = result.state
-                        detail = result.detail
-                        kind = result.kind
-                        extra = result.extra
-                else:
-                    detail = "the download page did not expose a file id"
-
-        if not destination and host_known:
-            if browser_links is None:
-                browser_links = _browser_links_for_sources(quality, url)
-            entry = browser_links.get(token) or {}
-            links = entry.get("links") or []
-            replacement = _match_browser_link(links, host, token) if links else None
-            if replacement:
-                replacement_problem = validate_host_id(
-                    replacement.get("host") or "", replacement.get("file_id") or ""
-                )
-                if replacement_problem:
-                    state = "missing"
-                    detail = replacement_problem
-                else:
-                    result = toonworld_hosts.resolve(
-                        replacement["host"],
-                        replacement["file_id"],
-                        referer=url,
-                        domain=_host_domain(replacement.get("url") or ""),
-                    )
-                    destination = result.url
-                    state = result.state
-                    detail = result.detail
-                    kind = result.kind
-                    extra = result.extra
-            elif entry.get("error") and detail:
-                detail = f"{detail}; {entry['error']}"
-            elif entry.get("error"):
-                detail = entry["error"]
-            elif not links:
-                reason = _browser_fallback_reason()
-                if reason:
-                    detail = f"{detail}; {reason}" if detail else reason
-
-        if destination and state == "ready" and kind != "mega":
+            destination, error = source["direct"], None
+        elif host.lower() == "appdrive" and token:
+            destination, error = resolve_appdrive(token.rsplit("/", 1)[-1])
+        else:
+            destination, error = resolve_destination(token)
+        status = {"state": "unknown", "detail": error or ""}
+        if destination:
             status = probe_destination(destination)
-            if status.get("state") == "missing":
-                state = "missing"
-                detail = status.get("detail") or detail
-            elif status.get("state") == "blocked":
-                state = "blocked"
-                detail = status.get("detail") or detail
-
+            # The identifier the host actually receives is the last path
+            # segment of the destination, not the redirect token.
+            file_id = destination.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+            problem = validate_host_id(source.get("host") or "", file_id)
+            if problem and status.get("state") in {"missing", "blocked", "unknown", "page"}:
+                status = {"state": "missing", "detail": problem}
         resolved.append(
             {
-                "host": host,
+                "host": source.get("host"),
                 "token": token,
                 "url": destination,
-                "error": None if destination else (detail or "no destination"),
-                "state": state,
-                "detail": detail,
-                "kind": kind,
-                "extra": extra,
-                "expected_size": expected_size,
+                "error": error,
+                "state": status.get("state"),
+                "detail": status.get("detail"),
             }
         )
     return resolved
-
-
-def _browser_links_for_sources(
-    quality: Dict[str, Any], url: str, timeout: int = 150
-) -> Dict[str, Dict[str, Any]]:
-    """Follow every interstitial in one browser session.
-
-    The archive sends one shortener link per host, so every token is opened in
-    the same browser.  The result maps a token onto the links the shortener
-    finally offered.  The answers are cached, because the shortener hands out
-    the same links for a while.
-    """
-    from . import browser as browser_module
-
-    tokens = [source.get("token") for source in quality.get("sources", []) if source.get("token")]
-    if not tokens:
-        return {}
-
-    collected: Dict[str, Dict[str, Any]] = {}
-    pending = []
-    for token in tokens:
-        cached = _cached_browser_links(token)
-        if cached is None:
-            pending.append(token)
-        else:
-            collected[token] = cached
-    if not pending:
-        return collected
-    if not browser_module.browser_available():
-        return collected
-
-    budget = max(30, timeout // max(1, len(pending)))
-    session = browser_module.BrowserSession(timeout_ms=budget * 1000)
-    try:
-        session.start()
-    except browser_module.BrowserUnavailable:
-        return collected
-
-    try:
-        for token in pending:
-            outcome = _follow_token_in_session(session, token, budget)
-            entry = {"links": outcome.get("links") or [], "error": outcome.get("error")}
-            collected[token] = entry
-            _cache_browser_links(token, entry)
-    finally:
-        session.close()
-    return collected
-
-
-_BROWSER_LINK_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-_BROWSER_LINK_CACHE_TTL = 1800.0
-
-
-def _cached_browser_links(token: str) -> Optional[Dict[str, Any]]:
-    """Return the links of a token when they are still fresh."""
-    entry = _BROWSER_LINK_CACHE.get(token)
-    if not entry:
-        return None
-    stored_at, links = entry
-    if time.monotonic() - stored_at > _BROWSER_LINK_CACHE_TTL:
-        _BROWSER_LINK_CACHE.pop(token, None)
-        return None
-    return links
-
-
-def _cache_browser_links(token: str, links: Dict[str, Any]) -> None:
-    _BROWSER_LINK_CACHE[token] = (time.monotonic(), dict(links))
-
-
-def _host_domain(url: str) -> Optional[str]:
-    """Return the host of a file page so the resolver can use that domain."""
-    match = re.match(r"https?://([^/]+)", url or "", re.I)
-    return match.group(1) if match else None
-
-
-def _browser_fallback_reason() -> str:
-    """Explain why the browser fallback could not run."""
-    from . import browser as browser_module
-
-    if not browser_module.browser_available():
-        return (
-            "the browser fallback is not available on this deployment, "
-            "so the file id could not be picked up from the rendered page"
-        )
-    return "the browser fallback did not find a file link on the rendered page"
-
-
-def _match_browser_link(
-    links: List[Dict[str, Any]], host: str, token: str
-) -> Optional[Dict[str, Any]]:
-    """Pick the browser link that belongs to *host*."""
-    wanted = toonworld_hosts.normalize_host(host)
-    for link in links:
-        if toonworld_hosts.normalize_host(link.get("host") or "") == wanted:
-            return link
-    return links[0] if len(links) == 1 else None
-

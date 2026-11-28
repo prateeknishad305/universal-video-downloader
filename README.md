@@ -24,7 +24,7 @@ batch queues, cancellation, and a clean API you can script against.
 | **Audio extraction** | Pull the MP3 (192 kbps) or keep the original audio codec |
 | **Playlists** | Expand a playlist, tick the videos you want, queue them all |
 | **Batch mode** | Paste many links and download them in parallel |
-| **Cancellation** | Stop a download mid-flight, or delete a running job; every leftover file is cleaned up |
+| **Cancellation** | Stop a download mid-flight; partial files are cleaned up |
 | **Subtitles** | Optionally embed subtitles when the source has them |
 | **Auth for gated sites** | Use browser cookies for age- or login-gated content |
 | **Telegram bot** | Send a link in Telegram, pick a quality with buttons, get the file back |
@@ -65,14 +65,6 @@ Open <http://127.0.0.1:8000>. Files land in `./data/downloads`.
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-The browser route needs Playwright and a Chromium build. They are kept out of
-the core requirements because they add 565 MB to the install:
-
-```bash
-.venv/bin/pip install -r requirements-browser.txt
-.venv/bin/python -m playwright install chromium
 ```
 
 ### Install ffmpeg
@@ -149,16 +141,6 @@ Everything is controlled by environment variables (see `.env.example`):
 | `TELEGRAM_ALLOWED_CHATS` | *(empty)* | Comma separated chat ids allowed to use the bot |
 | `TELEGRAM_MAX_UPLOAD_MB` | `50` | Telegram's own upload limit |
 | `PUBLIC_URL` | *(empty)* | Public base URL, used in bot messages |
-| `UVD_BROWSER_ENABLED` | `1` | Set to `0` to run without the browser route |
-| `UVD_BROWSER_EXECUTABLE` | *(auto)* | Path of the Chromium build |
-| `UVD_BROWSER_HEADLESS` | `1` | `0` shows the browser window |
-| `UVD_BROWSER_PROFILE` | `./data/browser-profile` | Profile that keeps the clearance cookies |
-| `UVD_BROWSER_TIMEOUT_MS` | `45000` | How long the browser waits for a page |
-| `UVD_MIN_MEDIA_BYTES` | `16384` | Below this a file counts as a placeholder |
-| `UVD_MAX_FILE_MB` | `0` | Largest file that may be downloaded, `0` means no limit |
-| `UVD_MAX_HISTORY_JOBS` | `200` | How many finished jobs are kept in memory |
-| `UVD_MIN_FREE_DISK_MB` | `0` | Free space that has to stay for a new download |
-| `UVD_FFMPEG_THREADS` | `2` | Threads ffmpeg may use while merging |
 
 ### Running it on your network
 
@@ -168,80 +150,6 @@ HOST=0.0.0.0 API_TOKEN=$(openssl rand -hex 16) ./run.sh
 
 Then open `http://<your-ip>:8000/?token=<the-token>` once — the app stores the
 token and strips it from the URL.
-
----
-
-## Hosting on Render
-
-Render runs the app as a Docker service. The repository ships everything that
-is needed: `Dockerfile`, `Procfile` and `render.yaml`.
-
-### 1. The blueprint (fastest)
-
-1. Push the repository to GitHub.
-2. In Render choose **New → Blueprint**, pick the repository and the
-   `render.yaml` at its root.
-3. Render creates the web service with a 10 GB disk for the downloads and
-   deploys it.
-
-The blueprint generates an `API_TOKEN`. Pass it as `x-api-token` (or
-`?token=`) on every `/api` call; `/api/health` stays open so the platform can
-check the service.
-
-The blueprint cannot create MongoDB, so `MONGO_URI` waits for you. Create a
-MongoDB instance in the Render dashboard and paste its connection string into
-`MONGO_URI`. Without it the job history lives in memory and disappears with
-the service.
-
-### 2. A plain Docker service
-
-| Setting | Value |
-|---|---|
-| Runtime | Docker |
-| Dockerfile path | `./Dockerfile` |
-| Health check path | `/api/health` |
-| Compute plan | `0.5c-512mb` (512 MB, 0.5 CPU) |
-| Disk | 10 GB on `/data` (a disk needs a paid plan) |
-
-The free plan works for testing, but it has no disk, so the files are gone
-after every restart, and a persistent disk cannot be attached to it.
-
-### 3. Big movies: 1-2 GB
-
-Big files are streamed to disk, so their size costs disk space and time, not
-memory. A 1 GiB download ran through the API with a peak of 112 MB of RAM.
-
-| Rule | Value |
-|---|---|
-| Largest file | `UVD_MAX_FILE_MB=2048` (2 GB). yt-dlp aborts a bigger file when the host announces its size |
-| Disk needed | The file itself, and about twice that while a separate video and audio stream are merged |
-| Disk guard | `UVD_MIN_FREE_DISK_MB=512` free space has to stay; a running download stops with a clear error when the disk fills up |
-| Disk on Render | 10 GB, so a 2 GB movie plus the merge fits with room to spare |
-
-A 2 GB movie on a 2 MB/s line takes about 17 minutes. Raise
-`UVD_MAX_FILE_MB` if you want bigger files and give the service a bigger disk
-at the same time.
-
-### What keeps it fast and out of the OOM killer
-
-| Measure | Why |
-|---|---|
-| `UVD_BROWSER_ENABLED=0` by default in the image | Chromium alone needs about 500 MB; without it the service stays near 110 MB |
-| Playwright is not part of `requirements.txt` | The image stays small and the install stays quick. Build with `--build-arg INSTALL_BROWSER=1` when the browser route is wanted |
-| One uvicorn worker, no `--workers` | Every worker copies the whole Python heap |
-| `MAX_CONCURRENT_JOBS=1` | One download, one ffmpeg merge, one memory spike |
-| `UVD_MAX_FILE_MB=2048` | yt-dlp refuses a file bigger than the cap, so the disk cannot fill up |
-| `UVD_MIN_FREE_DISK_MB=512` | A download refuses to start when the disk is nearly full and stops when it fills up |
-| `UVD_FFMPEG_THREADS=2` | ffmpeg stops from spawning a thread per core, which is what usually kills a small container |
-| `UVD_MAX_HISTORY_JOBS=200` | The in-memory job list cannot grow without a limit |
-| yt-dlp cache switched off (`cachedir: False`) | No growing cache directory in the container |
-| `PYTHONMALLOC=malloc`, `MALLOC_ARENA_MAX=2`, `OMP_NUM_THREADS=1` | Fewer and smaller memory arenas |
-| Lazy imports | yt-dlp, Telegram and pymongo are only imported when they are used, so the container answers the health check in about 0.7 s |
-| `dumb-init` and `--proxy-headers` | Correct signal handling and the real client IP behind Render's proxy |
-
-A download on the paid plan needs about 110 MB of RAM and the disk space for
-the file itself. The Render disk (`/data`) keeps finished files between
-deploys; without a disk the files disappear when the service restarts.
 
 ---
 
@@ -259,7 +167,7 @@ deploys; without a disk the files disappear when the service restarts.
 | `GET` | `/api/jobs/{id}` | One job's state |
 | `GET` | `/api/jobs/{id}/events` | Server-sent events with live progress |
 | `POST` | `/api/jobs/{id}/cancel` | Cancel a running download |
-| `DELETE` | `/api/jobs/{id}` | Forget a job (`?delete_file=true` also removes the file); a running download is stopped first |
+| `DELETE` | `/api/jobs/{id}` | Forget a job (`?delete_file=true` also removes the file) |
 | `GET` | `/api/jobs/{id}/file` | Download the finished file |
 | `POST` | `/api/clear-finished` | Remove all finished jobs from the list |
 
@@ -290,27 +198,21 @@ app/
   storage.py        Job history: MongoDB store with an in-memory fallback
   telegram_bot.py   Telegram bot front end (long polling)
   sources/
-    http.py             HTTP helper with browser impersonation
-    browser.py          Chromium session (Playwright) for JavaScript challenges
-    mega.py             MEGA API client and AES-128-CTR decryption
-    toonworld.py        Native toonworld4all.me extractor
-    toonworld_hosts.py  Filepress, GDFlix, HubCloud, MEGA and AppDrive resolvers
-    multimovies.py      Native multimovies.wtf extractor
-    embed_resolver.py   Resolves the streaming providers used by multimovies
+    http.py           HTTP helper with browser impersonation
+    toonworld.py      Native toonworld4all.me extractor
+    multimovies.py    Native multimovies.wtf extractor
+    embed_resolver.py Resolves the streaming providers used by multimovies
 static/
   index.html        Single-page UI
   styles.css        Dark theme
   app.js            Front-end logic (SSE + polling fallback)
 tests/
-  test_api.py              Offline test suite (no network required)
-  test_toonworld.py        Episode, season and token parsing
-  test_toonworld_hosts.py  Host resolvers
-  test_toonworld_resolution.py  Resolution pipeline and download checks
-  test_jobs_cancel.py      Cancel and delete behaviour of the job queue
-  test_multimovies.py      multimovies.wtf extractor
-  test_storage.py          MongoDB / in-memory job history
-  test_telegram_bot.py     Telegram command handling
-  test_telegram_flow.py    Telegram keyboard and upload flow
+  test_api.py           Offline test suite (no network required)
+  test_toonworld.py     toonworld4all.me extractor
+  test_multimovies.py   multimovies.wtf extractor
+  test_storage.py       MongoDB / in-memory job history
+  test_telegram_bot.py  Telegram command handling
+  test_telegram_flow.py Telegram keyboard and upload flow
 ```
 
 ---
@@ -338,8 +240,7 @@ refuses to write anything under `.github/workflows`.)
 ```
 
 The suite runs entirely offline — yt-dlp is stubbed out — so it never depends on
-a live site being reachable. It currently reports **85 passed, 2 skipped** (the
-skipped tests need `ffmpeg`/`ffprobe`).
+a live site being reachable.
 
 ---
 
@@ -412,6 +313,19 @@ are encrypted.
 
 **What the extractor does**
 
+Every kind of page on the site is understood natively:
+
+| Page | Example | Result |
+|---|---|---|
+| Archive episode | `archive.toonworld4all.me/episode/naruto-shippuden-1x373` | A video with its quality tiers |
+| Archive movie | `archive.toonworld4all.me/movie/steps-2026` | A video with its quality tiers |
+| Front-end movie | `toonworld4all.me/steps-2026-multi-audio-hindi/` | The movie, as a video |
+| Show page | `toonworld4all.me/naruto-shippuden-season-18-…` | A playlist of episodes |
+| Category page | `toonworld4all.me/category/netflix/` | A playlist of titles |
+| Tag page | `toonworld4all.me/tag/animated-movies` | A playlist of titles |
+| Index page | `toonworld4all.me/all-movies-list_25/` | A playlist of titles |
+| Home page | `toonworld4all.me/` | A playlist of titles |
+
 1. A **season page** (`/naruto-shippuden-season-18-…`) is turned into a
    playlist of episode URLs on `archive.toonworld4all.me`.
 2. An **episode page** is parsed from the `window.__PROPS__` JSON that the
@@ -429,57 +343,25 @@ are encrypted.
 
    Each tier carries the files offered for it on four hosts
    (HubCloud, Filepress, GDFlix, MEGA).
-3. Every host is resolved through its **own resolver** and health-checked
-   before the download starts. The downloader then tries each host in turn and
-   reports precisely why a host was skipped.
+3. A **movie page** points at the archive's `/movie/` page, which carries the
+   same `encodes` structure as an episode, so a movie resolves to the same
+   six quality tiers.
+4. A **category, tag, index or home page** is read as a list of titles. The
+   navigation menu is on every page, so only the content region is scanned
+   and the menu links are filtered out. Category and tag pages are followed
+   through their pagination.
+
+5. Every host is resolved and **health-checked** before the download starts.
+   The downloader then tries each host in turn and reports precisely why a
+   host was skipped.
 
 **How the redirect tokens are decoded**
 
-Each file link is an encrypted `/redirect/<token>`. The archive app decodes it
-server-side and answers with an interstitial page that carries
-
-* `link.domain` — the host the file lives on (`https://hubcloud.mov/drive/`),
-* `link.hidden` — the file id on that host,
-* `destination` — the ad shortener that guards the real links.
-
-The interstitial is only shown to a visitor without a session cookie; a
-second request with the same session is bounced to the shortener, so every
-token is resolved with a *fresh* session.
-
-**Host resolvers**
-
-| Host | How the file is resolved |
-|---|---|
-| Filepress | `GET /api/file/get/<id>` returns the file description including `downloadUrl` |
-| GDFlix | the server-rendered file page carries the Google Drive link, which yt-dlp downloads |
-| HubCloud | the JavaScript challenge is answered, then `api/downloader.php` returns the file URL |
-| MEGA | the file key is used with the MEGA API; the payload is decrypted with AES-128-CTR |
-| AppDrive | the JavaScript redirect chain is followed to the real file |
-
-Every resolver is called with the **domain the archive stored** (`link.domain`,
-for example `https://hubcloud.mov/drive/`), so a host that moved to a new
-domain keeps working; the known domain is only the fallback. The host itself is
-matched by name, so `HubCloud`, `hubcloud.mov` and
-`https://hubcloud.mov/drive/` all land on the same resolver.
-
-**The shortener**
-
-The ids the archive stores are placeholders: the hosts answer *"the file does
-not exist"*. The real links are behind the ad shortener of the interstitial.
-When that happens the downloader opens a **real Chromium session**
-(Playwright), lets the shortener run its own JavaScript and picks up the host
-links the shortener hands out. Verification widgets are never clicked; the
-page is only given the chance to verify itself, and when it does not, the job
-reports that instead of pretending the file was downloaded.
-
-The browser route is used whenever the direct route does not produce a file:
-
-* the redirect page exposes **no file id** at all,
-* the stored id is rejected by its host (a placeholder id),
-* the resolved link does not serve a file.
-
-The link the browser finds is matched back to the source by host name, so a
-shortener page that offers one link per host still fills the right tier.
+Each file link is an encrypted `/redirect/<token>`. The archive app decodes
+it server-side and shows the destination on an interstitial page — but only
+for a visitor that has no session cookie yet. A second request with the same
+session is bounced to the ad shortener instead, so every token is resolved
+with a *fresh* session.
 
 **The tokens rotate**
 
@@ -499,45 +381,42 @@ token and asserts that the download uses the new one.
 
 Both `toonworld4all.me` and `archive.toonworld4all.me` sit behind Cloudflare's
 bot detection. The app uses `curl_cffi` to present a genuine Chrome TLS/HTTP
-fingerprint, which clears the challenge without needing a browser.
+fingerprint, which clears the challenge without needing a headless browser.
 
-**Placeholder protection**
+**Host health check**
 
-A host that answers with a placeholder instead of the episode is detected:
-the finished file is checked against `UVD_MIN_MEDIA_BYTES` (16 KiB by
-default), against the `video-bytes` marker some hosts return, against the size
-the archive announced for the tier, and with `ffprobe` so only a file with
-real media streams passes. A placeholder is treated as a failed host, so the
-download moves on to the next host instead of handing an 11 byte file to the
-user.
+Every host is probed before a download starts, and the job log reports exactly
+why a host was skipped. The same pattern shows up for movies as well as for
+episodes — this is what the downloader reports for the Naruto: Shippuden
+season 18 links and for the movie "Steps (2026)":
 
-**Browser settings**
+| Host | Reported status | What it means |
+|---|---|---|
+| HubCloud | `the host says the file does not exist` | `hubcloud.mov` answers `404 ! File Not Found`; the domain now redirects to `hubcloud.foo`, which is a parked domain |
+| Filepress | `invalid FilePress id '<id>' - FilePress only accepts a 24 character hexadecimal object id` | The archive stores legacy nanoid ids; FilePress moved to MongoDB object ids |
+| GDFlix | `the host says the file was removed` | `gdflix.dev` replies *"The file you are trying to download is no longer available!"* |
+| MEGA | `invalid MEGA handle '<id>' (52 chars) - MEGA file handles are 22 characters` | The stored handle is not a MEGA handle, so MEGA serves its landing page |
 
-| Variable | Meaning |
-|---|---|
-| `UVD_BROWSER_EXECUTABLE` | Path of the Chromium build, when it is not in a usual place |
-| `UVD_BROWSER_HEADLESS` | `1` (default) runs the browser without a window, `0` shows it |
-| `UVD_BROWSER_PROFILE` | Directory that keeps the cookies a challenge hands out |
-| `UVD_BROWSER_TIMEOUT_MS` | How long the browser waits for a page |
+The same pattern was verified across 12 episodes from 10 different shows
+(One Piece, Bleach, Attack on Titan, Dragon Ball Super, Hunter × Hunter,
+Demon Slayer, …), so it is a **site-side data problem**, not a downloader
+problem: the stored file links are stale.
 
-The browser is optional: without it the downloader still resolves every host
-that does not need a JavaScript challenge.
+**How to fix the links**
 
-**When the shortener asks for a human check**
+Any of these makes the downloader work immediately — no code change needed:
 
-Some networks make the shortener show a Cloudflare checkbox that never clears
-by itself. The downloader never clicks it. In that case the job ends with the
-reason per host, for example:
+1. **Host the files yourself.** Put them under `wp-content/uploads/` and store
+   the plain URL in the episode's file list. The extractor uses absolute URLs
+   as-is (a direct file link never goes through the redirect decoder).
+2. **Re-point at a host with the current id format** — a 24 character hex
+   object id for FilePress, a 22 character handle for MEGA.
+3. **Flip `redirect.direct` to `true`** in the archive app config. The
+   interstitial page with the ad-shortener choice then disappears and the
+   redirect points straight at the file.
 
-```
-Every download host failed for this episode. HubCloud: the host page did not
-expose a direct file URL (the archive id looks like a placeholder) | Filepress:
-Invaild File ID; the ad shortener asks for a Cloudflare verification that did
-not complete on its own | ...
-```
-
-No file is written in that case. `/api/health` reports the Chromium build the
-browser route would use (`browser`, `browser_path`).
+The downloader also fails over automatically: if one host is dead it moves to
+the next, so a single stale host never blocks a download.
 
 ---
 
