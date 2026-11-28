@@ -408,6 +408,7 @@ function scheduleJobRender(job) {
   else setTimeout(flush, 60);
 }
 
+
 function subscribe(jobId) {
   if (state.sources.has(jobId)) return;
   const url = `/api/jobs/${jobId}/events${API.token ? `?token=${encodeURIComponent(API.token)}` : ''}`;
@@ -646,7 +647,8 @@ function buildSiteChips() {
     list.appendChild(chip);
     return chip;
   });
-  $('#sitesEmpty').hidden = siteChips.length > 0;
+  const empty = $('#sitesEmpty');
+  if (empty) empty.hidden = siteChips.length > 0;
 }
 
 function renderSites(filter = '') {
@@ -657,7 +659,8 @@ function renderSites(filter = '') {
     chip.hidden = !match;
     if (match) visible += 1;
   }
-  $('#sitesEmpty').hidden = visible > 0;
+  const empty = $('#sitesEmpty');
+  if (empty) empty.hidden = visible > 0;
 }
 
 /* ------------------------------------------------------------------ init -- */
