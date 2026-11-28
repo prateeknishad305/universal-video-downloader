@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 import threading
 import time
 import uuid
@@ -22,27 +21,10 @@ from .ytdlp_client import (
 
 TERMINAL_STATES = {"completed", "error", "cancelled"}
 
-
-def _disk_free_mb() -> int:
-    """Free space on the download disk in MB, 0 when it cannot be read."""
-    try:
-        return shutil.disk_usage(str(config.DOWNLOAD_DIR)).free // (1024 * 1024)
-    except Exception:
-        return 0
-
-
-def _disk_space_problem(needed_mb: int = 0) -> str:
-    """Complain when the download disk is too full for a new file."""
-    required = int(config.MIN_FREE_DISK_MB) + max(0, needed_mb)
-    if required <= 0:
-        return ""
-    free_mb = _disk_free_mb()
-    if free_mb < required:
-        return (
-            f"The download disk has only {free_mb} MB free, "
-            f"at least {required} MB are needed."
-        )
-    return ""
+# Finished jobs stay in memory so the UI can still fetch their file, but a
+# long-running server must not hold on to them forever. The web UI keeps 100
+# cards, so this stays comfortably above that.
+MAX_FINISHED_JOBS = 120
 
 
 @dataclass
@@ -72,7 +54,6 @@ class Job:
     updated_at: float = field(default_factory=time.time)
     version: int = 0
     cancel_requested: bool = False
-    removed: bool = False
     logs: List[str] = field(default_factory=list)
 
     # -- mutations -------------------------------------------------------- #
@@ -137,8 +118,6 @@ class JobManager:
     # -- persistence ------------------------------------------------------ #
     def _persist(self, job: Job) -> None:
         """Mirror a job snapshot into the history store (never blocks)."""
-        if job.removed:
-            return
         snapshot = job.to_dict()
         try:
             loop = asyncio.get_running_loop()
@@ -188,9 +167,9 @@ class JobManager:
             quality = {
                 "id": "best",
                 "label": "Best available",
-                "selector": "bestvideo+bestaudio/best",
+                "selector": "best",
                 "kind": "combined",
-                "requires_merge": True,
+                "requires_merge": False,
             }
 
         effective_mode = mode
@@ -265,22 +244,8 @@ class JobManager:
         )
         with self._lock:
             self._jobs[job.id] = job
-            self._trim_jobs()
         self._persist(job)
         return job
-
-    def _trim_jobs(self) -> None:
-        """Drop the oldest finished jobs so the memory stays bounded."""
-        limit = max(10, int(config.MAX_HISTORY_JOBS))
-        if len(self._jobs) <= limit:
-            return
-        finished = [
-            job for job in self._jobs.values() if job.status in TERMINAL_STATES
-        ]
-        finished.sort(key=lambda job: job.created_at)
-        while len(self._jobs) > limit and finished:
-            oldest = finished.pop(0)
-            self._jobs.pop(oldest.id, None)
 
     def start(self, job: Job, selector: str, subtitles: bool = False) -> None:
         """Schedule the download of *job*."""
@@ -313,13 +278,6 @@ class JobManager:
                         job.eta = data.get("eta")
                         job.progress = (done / total * 100.0) if total else 0.0
                         job.stage = "Downloading"
-                        if total and config.MIN_FREE_DISK_MB > 0:
-                            free_mb = _disk_free_mb()
-                            if free_mb < int(config.MIN_FREE_DISK_MB):
-                                raise RuntimeError(
-                                    f"The download disk ran out of space, "
-                                    f"only {free_mb} MB were left."
-                                )
                     job.touch()
 
             def on_log(level: str, message: str) -> None:
@@ -336,12 +294,6 @@ class JobManager:
                     job.stage = "Starting..."
                     job.touch()
 
-                space_problem = _disk_space_problem()
-                if space_problem:
-                    raise RuntimeError(space_problem)
-
-                finished_path: Optional[Path] = None
-
                 path: Path = await asyncio.to_thread(
                     download_media,
                     job.url,
@@ -353,11 +305,8 @@ class JobManager:
                     on_log=on_log,
                     should_cancel=should_cancel,
                 )
-                finished_path = path
 
                 with self._lock:
-                    if job.cancel_requested:
-                        raise CancelledError("Download cancelled by the user.")
                     job.filepath = str(path)
                     job.filename = path.name
                     job.status = "completed"
@@ -368,14 +317,10 @@ class JobManager:
                     job.touch()
                     job.add_log("info", f"Saved to {path.name}")
                 self._persist(job)
+                self._prune_finished()
 
             except CancelledError:
                 remove_partial_files(config.DOWNLOAD_DIR, stem)
-                if finished_path is not None:
-                    try:
-                        finished_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
                 self._finish_cancelled(job)
             except Exception as exc:  # noqa: BLE001 - surfaced to the UI
                 remove_partial_files(config.DOWNLOAD_DIR, stem)
@@ -386,6 +331,18 @@ class JobManager:
                     job.touch()
                     job.add_log("error", job.error)
                 self._persist(job)
+                self._prune_finished()
+
+    def _prune_finished(self) -> None:
+        """Drop the oldest finished jobs from memory."""
+        with self._lock:
+            finished = [j for j in self._jobs.values() if j.status in TERMINAL_STATES]
+            if len(finished) <= MAX_FINISHED_JOBS:
+                return
+            finished.sort(key=lambda j: j.updated_at)
+            for stale in finished[: len(finished) - MAX_FINISHED_JOBS]:
+                self._jobs.pop(stale.id, None)
+                self._tasks.pop(stale.id, None)
 
     def _finish_cancelled(self, job: Job) -> None:
         with self._lock:
@@ -396,6 +353,7 @@ class JobManager:
             job.touch()
             job.add_log("warning", "Download cancelled.")
         self._persist(job)
+        self._prune_finished()
 
     # -- control ---------------------------------------------------------- #
     def cancel(self, job_id: str) -> bool:
@@ -411,16 +369,14 @@ class JobManager:
 
     def remove(self, job_id: str, delete_file: bool = False) -> bool:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return False
-            job.removed = True
-            if job.status not in TERMINAL_STATES:
-                job.cancel_requested = True
-                job.stage = "Cancelling..."
-                job.touch()
-            self._jobs.pop(job_id, None)
-            self._tasks.pop(job_id, None)
+            job = self._jobs.pop(job_id, None)
+            task = self._tasks.pop(job_id, None)
+        if job is None:
+            return False
+        if job.status not in TERMINAL_STATES:
+            self.cancel(job_id)
+        if task is not None and not task.done():
+            task.cancel()
         if delete_file and job.filepath:
             try:
                 Path(job.filepath).unlink(missing_ok=True)

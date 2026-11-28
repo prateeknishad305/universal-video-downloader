@@ -230,9 +230,44 @@ function renderAnalysis(analysis) {
 
 /* --------------------------------------------------------- render playlist -- */
 
+// A long series can have thousands of episodes. Rendering every row at once
+// floods the DOM and keeps every thumbnail in memory, so the list is built in
+// pages and grows only when the user asks for more.
+const PLAYLIST_PAGE = 200;
+
+let playlistEntries = [];
+let playlistSelected = new Set();
+let playlistRendered = 0;
+
+function entryRow(entry, index) {
+  const thumb = entry.thumbnail
+    ? `<img class="entry-thumb" src="${escapeHtml(entry.thumbnail)}" alt="" loading="lazy" decoding="async" onerror="this.style.visibility='hidden'">`
+    : '<div class="entry-thumb"></div>';
+  return `
+    <div class="entry" data-index="${index}">
+      <input type="checkbox" class="entry-check" value="${index}" ${playlistSelected.has(index) ? 'checked' : ''} />
+      ${thumb}
+      <div class="entry-info">
+        <div class="entry-title">${escapeHtml(entry.title)}</div>
+        <div class="entry-sub">${entry.duration ? formatDuration(entry.duration) : ''}${entry.uploader ? ` · ${escapeHtml(entry.uploader)}` : ''}</div>
+      </div>
+      <button class="ghost-btn tiny entry-download" type="button" data-index="${index}">Get</button>
+    </div>`;
+}
+
+function appendPlaylistPage(container, entries) {
+  const next = entries.slice(playlistRendered, playlistRendered + PLAYLIST_PAGE);
+  if (!next.length) return false;
+  container.insertAdjacentHTML('beforeend', next.map((entry, offset) => entryRow(entry, playlistRendered + offset)).join(''));
+  playlistRendered += next.length;
+  return true;
+}
+
 function renderPlaylist(analysis) {
   const results = $('#results');
-  const entries = analysis.entries || [];
+  playlistEntries = analysis.entries || [];
+  playlistSelected = new Set(playlistEntries.map((_, index) => index));
+  playlistRendered = 0;
 
   results.innerHTML = `
     <div class="panel media-card">
@@ -247,33 +282,59 @@ function renderPlaylist(analysis) {
           Download selected
         </button>
       </div>
-      <div class="entry-list">
-        ${entries.map((entry, index) => `
-          <div class="entry">
-            <input type="checkbox" class="entry-check" value="${index}" checked />
-            ${entry.thumbnail ? `<img class="entry-thumb" src="${escapeHtml(entry.thumbnail)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">` : '<div class="entry-thumb"></div>'}
-            <div class="entry-info">
-              <div class="entry-title">${escapeHtml(entry.title)}</div>
-              <div class="entry-sub">${entry.duration ? formatDuration(entry.duration) : ''}${entry.uploader ? ` · ${escapeHtml(entry.uploader)}` : ''}</div>
-            </div>
-            <button class="ghost-btn tiny entry-download" type="button" data-index="${index}">Get</button>
-          </div>`).join('')}
+      <div class="entry-list" id="entryList"></div>
+      <div class="playlist-more" id="playlistMore" hidden>
+        <button class="ghost-btn tiny" id="showMoreBtn" type="button"></button>
       </div>
     </div>`;
 
-  const checks = $$('.entry-check');
-  $('#selectAllBtn').addEventListener('click', () => checks.forEach((c) => { c.checked = true; }));
-  $('#selectNoneBtn').addEventListener('click', () => checks.forEach((c) => { c.checked = false; }));
+  const list = $('#entryList');
+  appendPlaylistPage(list, playlistEntries);
 
-  $$('.entry-download').forEach((button) => {
-    button.addEventListener('click', () => {
-      const entry = entries[Number(button.dataset.index)];
-      if (entry) analyzeAndQueue(entry.url, entry.title);
-    });
+  const more = $('#playlistMore');
+  const showMore = $('#showMoreBtn');
+  const refreshMore = () => {
+    const left = playlistEntries.length - playlistRendered;
+    more.hidden = left <= 0;
+    showMore.textContent = `Show ${Math.min(left, PLAYLIST_PAGE)} more (${left} left)`;
+  };
+  refreshMore();
+
+  showMore.addEventListener('click', () => {
+    appendPlaylistPage(list, playlistEntries);
+    refreshMore();
+  });
+
+  // Selection lives outside the DOM, so it survives paging and rendering.
+  list.addEventListener('change', (event) => {
+    const box = event.target.closest('.entry-check');
+    if (!box) return;
+    const index = Number(box.value);
+    if (box.checked) playlistSelected.add(index);
+    else playlistSelected.delete(index);
+  });
+
+  $('#selectAllBtn').addEventListener('click', () => {
+    playlistSelected = new Set(playlistEntries.map((_, index) => index));
+    $$('.entry-check').forEach((box) => { box.checked = true; });
+  });
+  $('#selectNoneBtn').addEventListener('click', () => {
+    playlistSelected = new Set();
+    $$('.entry-check').forEach((box) => { box.checked = false; });
+  });
+
+  list.addEventListener('click', (event) => {
+    const button = event.target.closest('.entry-download');
+    if (!button) return;
+    const entry = playlistEntries[Number(button.dataset.index)];
+    if (entry) analyzeAndQueue(entry.url, entry.title);
   });
 
   $('#downloadSelectedBtn').addEventListener('click', async () => {
-    const selected = checks.filter((c) => c.checked).map((c) => entries[Number(c.value)]);
+    const selected = [...playlistSelected]
+      .sort((a, b) => a - b)
+      .map((index) => playlistEntries[index])
+      .filter(Boolean);
     if (!selected.length) {
       toast('Select at least one video.', 'info');
       return;
@@ -328,6 +389,25 @@ async function startDownload(payload) {
 
 /* ------------------------------------------------------------- job events -- */
 
+// Progress frames arrive several times a second, so they are coalesced into
+// one paint per frame instead of one DOM write per event.
+const pendingRenders = new Map();
+let renderScheduled = false;
+
+function scheduleJobRender(job) {
+  pendingRenders.set(job.id, job);
+  if (renderScheduled) return;
+  renderScheduled = true;
+  const flush = () => {
+    renderScheduled = false;
+    const jobs = [...pendingRenders.values()];
+    pendingRenders.clear();
+    for (const pending of jobs) renderJob(pending);
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(flush);
+  else setTimeout(flush, 60);
+}
+
 function subscribe(jobId) {
   if (state.sources.has(jobId)) return;
   const url = `/api/jobs/${jobId}/events${API.token ? `?token=${encodeURIComponent(API.token)}` : ''}`;
@@ -337,7 +417,7 @@ function subscribe(jobId) {
     try {
       const job = JSON.parse(event.data);
       state.jobs.set(job.id, job);
-      renderJob(job);
+      scheduleJobRender(job);
       if (['completed', 'error', 'cancelled'].includes(job.status)) {
         source.close();
         state.sources.delete(job.id);
@@ -361,7 +441,7 @@ async function pollJob(jobId) {
   try {
     const fresh = await api(`/api/jobs/${jobId}`);
     state.jobs.set(jobId, fresh);
-    renderJob(fresh);
+    scheduleJobRender(fresh);
     if (['completed', 'error', 'cancelled'].includes(fresh.status)) return;
   } catch (_) { /* ignore */ }
   setTimeout(() => pollJob(jobId), 1200);
@@ -369,21 +449,24 @@ async function pollJob(jobId) {
 
 /* ------------------------------------------------------------ render jobs -- */
 
-function jobCard(job) {
-  const stats = [];
+function jobStats(job) {
   if (job.status === 'downloading') {
-    stats.push(`<span>${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.total_bytes)}</span>`);
-    stats.push(`<span>${job.speed ? `${formatBytes(job.speed)}/s` : '—'} · ETA ${formatEta(job.eta)}</span>`);
-  } else if (job.status === 'completed') {
-    stats.push(`<span>${escapeHtml(job.filename || 'finished')}</span>`);
-    stats.push('<span>completed</span>');
-  } else {
-    stats.push(`<span>${escapeHtml(job.quality_label || '')}</span>`);
-    stats.push(`<span>${escapeHtml(job.status)}</span>`);
+    return [
+      `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.total_bytes)}`,
+      `${job.speed ? `${formatBytes(job.speed)}/s` : '—'} · ETA ${formatEta(job.eta)}`,
+    ];
   }
+  if (job.status === 'completed') {
+    return [job.filename || 'finished', 'completed'];
+  }
+  return [job.quality_label || '', job.status];
+}
+
+function jobCard(job) {
+  const stats = jobStats(job);
 
   const thumb = job.thumbnail
-    ? `<img class="job-thumb" src="${escapeHtml(job.thumbnail)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">`
+    ? `<img class="job-thumb" src="${escapeHtml(job.thumbnail)}" alt="" loading="lazy" decoding="async" onerror="this.style.visibility='hidden'">`
     : '<div class="job-thumb"></div>';
 
   const isLive = ['queued', 'downloading', 'processing'].includes(job.status);
@@ -410,7 +493,7 @@ function jobCard(job) {
   const error = job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : '';
 
   return `
-    <div class="job ${job.status}" data-job="${job.id}">
+    <div class="job ${job.status}" data-job="${job.id}" data-status="${job.status}">
       <div class="job-head">
         ${thumb}
         <div class="job-info">
@@ -420,10 +503,54 @@ function jobCard(job) {
         <div class="job-actions">${actions.join('')}</div>
       </div>
       <div class="progress-track"><div class="progress-bar" style="width:${Math.max(2, job.progress)}%"></div></div>
-      <div class="job-stats"><span>${stats[0]}</span><span>${stats[1]}</span></div>
+      <div class="job-stats"><span>${escapeHtml(stats[0])}</span><span>${escapeHtml(stats[1])}</span></div>
       ${error}
       ${saveBtn}
     </div>`;
+}
+
+// Progress frames arrive several times a second. Replacing the whole card
+// each time throws the subtree away and builds it again, so while the status
+// stays the same only the few text nodes and the bar width are touched.
+function updateJobCard(node, job) {
+  const stage = node.querySelector('.job-stage');
+  if (stage) stage.textContent = job.stage || job.status;
+
+  const bar = node.querySelector('.progress-bar');
+  if (bar) bar.style.width = `${Math.max(2, job.progress)}%`;
+
+  const stats = node.querySelectorAll('.job-stats span');
+  const values = jobStats(job);
+  if (stats[0]) stats[0].textContent = values[0];
+  if (stats[1]) stats[1].textContent = values[1];
+
+  const errorNode = node.querySelector('.job-error');
+  if (job.error) {
+    if (errorNode) errorNode.textContent = job.error;
+    else node.insertAdjacentHTML('beforeend', `<div class="job-error">${escapeHtml(job.error)}</div>`);
+  }
+}
+
+// Keep the download list bounded: a long-running session should not grow the
+// DOM (and the browser's memory) without limit.
+const MAX_JOB_CARDS = 100;
+
+function trimJobCards() {
+  const list = $('#jobList');
+  const cards = $$('.job', list);
+  if (cards.length <= MAX_JOB_CARDS) return;
+  const live = ['queued', 'downloading', 'processing'];
+  let removed = 0;
+  for (const card of cards.slice().reverse()) {
+    if (removed >= cards.length - MAX_JOB_CARDS) break;
+    if (live.includes(card.dataset.status)) continue;
+    const id = card.dataset.job;
+    card.remove();
+    state.jobs.delete(id);
+    const source = state.sources.get(id);
+    if (source) { source.close(); state.sources.delete(id); }
+    removed += 1;
+  }
 }
 
 function renderJob(job) {
@@ -433,9 +560,14 @@ function renderJob(job) {
 
   const existing = list.querySelector(`[data-job="${job.id}"]`);
   if (existing) {
-    existing.outerHTML = jobCard(job);
+    if (existing.dataset.status === job.status) {
+      updateJobCard(existing, job);
+    } else {
+      existing.outerHTML = jobCard(job);
+    }
   } else {
     list.insertAdjacentHTML('afterbegin', jobCard(job));
+    trimJobCards();
   }
 
   $('#jobCounter').textContent = state.jobs.size;
@@ -491,18 +623,41 @@ async function loadSites() {
   try {
     const data = await api('/api/sites');
     siteNames = data.sites || [];
+    buildSiteChips();
     $('#sitesBtn').textContent = `${data.count} supported sites`;
   } catch (_) {
     siteNames = [];
   }
 }
 
+// There are well over a thousand supported sites. They are built once and
+// then filtered by toggling visibility, so typing in the search box does not
+// rebuild a thousand nodes on every keystroke.
+let siteChips = [];
+
+function buildSiteChips() {
+  const list = $('#siteList');
+  list.innerHTML = '';
+  siteChips = siteNames.map((name) => {
+    const chip = document.createElement('span');
+    chip.className = 'site-chip';
+    chip.textContent = name;
+    chip.dataset.lower = name.toLowerCase();
+    list.appendChild(chip);
+    return chip;
+  });
+  $('#sitesEmpty').hidden = siteChips.length > 0;
+}
+
 function renderSites(filter = '') {
   const needle = filter.trim().toLowerCase();
-  const matches = needle ? siteNames.filter((n) => n.toLowerCase().includes(needle)) : siteNames;
-  $('#siteList').innerHTML = matches.length
-    ? matches.map((n) => `<span class="site-chip">${escapeHtml(n)}</span>`).join('')
-    : '<p style="color:var(--muted);font-size:13px">No site matches that filter.</p>';
+  let visible = 0;
+  for (const chip of siteChips) {
+    const match = !needle || chip.dataset.lower.includes(needle);
+    chip.hidden = !match;
+    if (match) visible += 1;
+  }
+  $('#sitesEmpty').hidden = visible > 0;
 }
 
 /* ------------------------------------------------------------------ init -- */
@@ -558,7 +713,12 @@ function init() {
   $('#sitesModal').addEventListener('click', (e) => {
     if (e.target === $('#sitesModal')) $('#sitesModal').hidden = true;
   });
-  $('#sitesSearch').addEventListener('input', (e) => renderSites(e.target.value));
+  let siteFilterTimer = null;
+  $('#sitesSearch').addEventListener('input', (e) => {
+    const value = e.target.value;
+    clearTimeout(siteFilterTimer);
+    siteFilterTimer = setTimeout(() => renderSites(value), 120);
+  });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') $('#sitesModal').hidden = true;
   });

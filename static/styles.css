@@ -277,6 +277,8 @@ body {
 .playlist-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 0 18px 14px; }
 
 .entry-list { max-height: 460px; overflow-y: auto; border-top: 1px solid var(--border); }
+.playlist-more { display: flex; justify-content: center; padding: 12px 18px 16px; border-top: 1px solid var(--border); }
+.playlist-more[hidden] { display: none; }
 .entry {
   display: flex; align-items: center; gap: 13px;
   padding: 11px 18px;
